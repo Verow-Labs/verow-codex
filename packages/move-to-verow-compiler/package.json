@@ -6,7 +6,7 @@
   "engines": { "node": ">=24.0.0" },
   "bin": { "move-to-verow": "./dist/cli.js" },
   "exports": { ".": "./dist/index.js" },
-  "files": ["dist", "contracts"],
+  "files": ["dist", "contracts", "npm-shrinkwrap.json"],
   "publishConfig": { "access": "public", "provenance": true },
   "scripts": {
     "build": "tsc -p tsconfig.json",

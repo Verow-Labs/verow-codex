@@ -43,6 +43,18 @@ function sha256(bytes: string | Uint8Array): `sha256:${string}` {
   return `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
 }
 
+export function compareCodePointStrings(left: string, right: string): number {
+  const leftPoints = [...left];
+  const rightPoints = [...right];
+  const length = Math.min(leftPoints.length, rightPoints.length);
+  for (let index = 0; index < length; index += 1) {
+    const difference =
+      (leftPoints[index]?.codePointAt(0) ?? 0) - (rightPoints[index]?.codePointAt(0) ?? 0);
+    if (difference !== 0) return difference;
+  }
+  return leftPoints.length - rightPoints.length;
+}
+
 export function makeInventoriedFile(path: string, content: Uint8Array): InventoriedFile {
   return {
     path,
@@ -95,7 +107,7 @@ export function discoverAppRoutes(files: readonly InventoriedFile[]): readonly s
       .filter((segment): segment is string => segment !== null);
     routes.add(`/${segments.join('/')}`);
   }
-  return [...routes].sort();
+  return [...routes].sort(compareCodePointStrings);
 }
 
 function addJsonCandidates(
@@ -105,11 +117,18 @@ function addJsonCandidates(
   locator = '',
 ): void {
   if (typeof value === 'string' && value.trim() !== '') {
-    candidates.push({ path, sourceKind: 'json', value, locator: locator || '/' });
+    candidates.push({
+      path,
+      sourceKind: 'json',
+      value,
+      locator: locator || '/',
+    });
     return;
   }
   if (Array.isArray(value)) {
-    value.forEach((item, index) => addJsonCandidates(candidates, path, item, `${locator}/${index}`));
+    value.forEach((item, index) =>
+      addJsonCandidates(candidates, path, item, `${locator}/${index}`),
+    );
     return;
   }
   if (value !== null && typeof value === 'object') {
@@ -168,7 +187,8 @@ export function collectContentCandidates(
     }
   }
   return candidates.sort((left, right) =>
-    `${left.path}\0${left.locator}\0${left.sourceKind}`.localeCompare(
+    compareCodePointStrings(
+      `${left.path}\0${left.locator}\0${left.sourceKind}`,
       `${right.path}\0${right.locator}\0${right.sourceKind}`,
     ),
   );
@@ -186,9 +206,13 @@ export function detectIntegrations(files: readonly InventoriedFile[]): readonly 
       ...Object.keys(packageJson.dependencies ?? {}),
       ...Object.keys(packageJson.devDependencies ?? {}),
     ];
-    return [...new Set(names.filter((name) =>
-      /(?:stripe|sentry|analytics|supabase|firebase|contentful|sanity)/iu.test(name),
-    ))].sort();
+    return [
+      ...new Set(
+        names.filter((name) =>
+          /(?:stripe|sentry|analytics|supabase|firebase|contentful|sanity)/iu.test(name),
+        ),
+      ),
+    ].sort(compareCodePointStrings);
   } catch {
     return [];
   }

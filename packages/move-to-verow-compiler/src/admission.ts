@@ -2,6 +2,7 @@ import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 import {
   collectContentCandidates,
+  compareCodePointStrings,
   detectIntegrations,
   digestFileInventory,
   discoverAppRoutes,
@@ -72,6 +73,8 @@ function isSecretName(name: string): boolean {
   return (
     lower === '.env' ||
     lower.startsWith('.env.') ||
+    lower === '.dev.vars' ||
+    lower.startsWith('.dev.vars.') ||
     lower === '.npmrc' ||
     lower === '.pypirc' ||
     lower === 'credentials' ||
@@ -97,10 +100,7 @@ function workspacePath(root: string, absolutePath: string): string {
   return relative(root, absolutePath).split(sep).join('/');
 }
 
-async function enumerateSafeFiles(input: {
-  root: string;
-  reader: WorkspaceReader;
-}): Promise<{
+async function enumerateSafeFiles(input: { root: string; reader: WorkspaceReader }): Promise<{
   files: InventoriedFile[];
   blockers: { code: SourceBlockerCode; path: string | null }[];
 }> {
@@ -110,11 +110,14 @@ async function enumerateSafeFiles(input: {
 
   async function visit(directory: string): Promise<void> {
     const entries = [...(await input.reader.readDirectory(directory))].sort((a, b) =>
-      a.name.localeCompare(b.name),
+      compareCodePointStrings(a.name, b.name),
     );
     for (const entry of entries) {
       if (!isSafeEntryName(entry.name)) {
-        blockers.push({ code: 'unsafe_path', path: workspacePath(canonicalRoot, directory) || null });
+        blockers.push({
+          code: 'unsafe_path',
+          path: workspacePath(canonicalRoot, directory) || null,
+        });
         continue;
       }
       const absolutePath = join(directory, entry.name);
@@ -140,7 +143,7 @@ async function enumerateSafeFiles(input: {
   }
 
   await visit(canonicalRoot);
-  files.sort((left, right) => left.path.localeCompare(right.path));
+  files.sort((left, right) => compareCodePointStrings(left.path, right.path));
   return { files, blockers };
 }
 
@@ -160,27 +163,64 @@ function hasConfiguredValue(value: unknown): boolean {
   return value !== null && value !== undefined && value !== false && value !== '';
 }
 
-function hasUnsupportedDependencySource(files: readonly InventoriedFile[]): boolean {
-  const packageJson = parseJson(files.find(({ path }) => path === 'package.json'));
-  if (!packageJson) return false;
-  const sections = ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies'];
-  for (const section of sections) {
-    const dependencies = packageJson[section];
-    if (dependencies === null || typeof dependencies !== 'object' || Array.isArray(dependencies)) {
+function isPublicRegistrySpecifier(value: string): boolean {
+  const source = value.trim();
+  if (source === '' || source === '.' || source === '..') return false;
+  if (source.startsWith('npm:')) {
+    const alias = source.slice(4);
+    const packagePattern = alias.startsWith('@')
+      ? /^(@[^/@\s]+\/[^@\s]+)(?:@(.+))?$/u
+      : /^([^/@\s]+)(?:@(.+))?$/u;
+    const match = packagePattern.exec(alias);
+    return match !== null && (match[2] === undefined || isPlainRegistrySpecifier(match[2]));
+  }
+  return isPlainRegistrySpecifier(source);
+}
+
+function isPlainRegistrySpecifier(source: string): boolean {
+  return (
+    !/\.(?:tar\.gz|tgz)$/iu.test(source) &&
+    !/[\\/:@\p{Cc}]/u.test(source) &&
+    /^[0-9A-Za-z*<>=~^|._+\- ]+$/u.test(source)
+  );
+}
+
+function unsupportedDependencyManifestPaths(files: readonly InventoriedFile[]): readonly string[] {
+  const paths: string[] = [];
+  const manifests = files.filter(
+    ({ path }) => path === 'package.json' || path.endsWith('/package.json'),
+  );
+  for (const manifest of manifests) {
+    const packageJson = parseJson(manifest);
+    if (!packageJson) {
+      paths.push(manifest.path);
       continue;
     }
-    for (const source of Object.values(dependencies)) {
+    let unsupported = false;
+    const sections = [
+      'dependencies',
+      'devDependencies',
+      'optionalDependencies',
+      'peerDependencies',
+    ];
+    for (const section of sections) {
+      const dependencies = packageJson[section];
+      if (dependencies === undefined) continue;
       if (
-        typeof source !== 'string' ||
-        /^(?:https?:|git(?:\+|:)|github:|gitlab:|bitbucket:|file:|link:|workspace:|portal:|patch:)/iu.test(
-          source.trim(),
-        )
+        dependencies === null ||
+        typeof dependencies !== 'object' ||
+        Array.isArray(dependencies)
       ) {
-        return true;
+        unsupported = true;
+        continue;
+      }
+      for (const source of Object.values(dependencies)) {
+        if (typeof source !== 'string' || !isPublicRegistrySpecifier(source)) unsupported = true;
       }
     }
+    if (unsupported) paths.push(manifest.path);
   }
-  return false;
+  return paths.sort(compareCodePointStrings);
 }
 
 function detectUnsupportedCapabilities(
@@ -204,9 +244,10 @@ function detectUnsupportedCapabilities(
   if (hosting && hasConfiguredValue(hosting.r2)) {
     blockers.push({ code: 'r2_binding', path: '.openai/hosting.json' });
   }
-  const dependencyNames = packageJson && typeof packageJson.dependencies === 'object'
-    ? Object.keys(packageJson.dependencies as Record<string, unknown>)
-    : [];
+  const dependencyNames =
+    packageJson && typeof packageJson.dependencies === 'object'
+      ? Object.keys(packageJson.dependencies as Record<string, unknown>)
+      : [];
   if (
     (hosting && (hasConfiguredValue(hosting.auth) || hasConfiguredValue(hosting.accessPolicy))) ||
     dependencyNames.some((name) => name === 'next-auth' || name.startsWith('@auth/')) ||
@@ -229,15 +270,15 @@ function detectUnsupportedCapabilities(
   ) {
     blockers.push({ code: 'durable_state', path: hostingFile?.path ?? null });
   }
-  if (hasUnsupportedDependencySource(files)) {
-    blockers.push({ code: 'unsupported_dependency_source', path: 'package.json' });
+  for (const path of unsupportedDependencyManifestPaths(files)) {
+    blockers.push({ code: 'unsupported_dependency_source', path });
   }
 
   const unique = new Map<string, { code: SourceBlockerCode; path: string | null }>();
   for (const blocker of blockers) unique.set(`${blocker.code}\0${blocker.path ?? ''}`, blocker);
   return [...unique.values()].sort((left, right) => {
     const codeOrder = blockerOrder.indexOf(left.code) - blockerOrder.indexOf(right.code);
-    return codeOrder || (left.path ?? '').localeCompare(right.path ?? '');
+    return codeOrder || compareCodePointStrings(left.path ?? '', right.path ?? '');
   });
 }
 

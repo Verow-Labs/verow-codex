@@ -24,7 +24,9 @@ async function syntheticSource() {
   await writeFile(join(generated, 'canonical-digest-vectors.json'), '[]\n');
   await writeFile(join(generated, 'must-not-copy.txt'), 'forbidden');
   await exec('git', ['init', '--quiet'], { cwd: root });
-  await exec('git', ['config', 'user.email', 'test@example.invalid'], { cwd: root });
+  await exec('git', ['config', 'user.email', 'test@example.invalid'], {
+    cwd: root,
+  });
   await exec('git', ['config', 'user.name', 'Contract Test'], { cwd: root });
   await exec('git', ['add', '.'], { cwd: root });
   await exec('git', ['commit', '--quiet', '-m', 'fixture'], { cwd: root });
@@ -34,7 +36,9 @@ async function syntheticSource() {
 test('imports only exact generated contract artifacts and records clean HEAD', async () => {
   const source = await syntheticSource();
   const destination = await mkdtemp(join(tmpdir(), 'verow-contract-destination-'));
-  const expectedCommit = (await exec('git', ['rev-parse', 'HEAD'], { cwd: source.root })).stdout.trim();
+  const expectedCommit = (
+    await exec('git', ['rev-parse', 'HEAD'], { cwd: source.root })
+  ).stdout.trim();
 
   const provenance = await importBundleContract({
     sourceRoot: source.root,
@@ -56,12 +60,18 @@ test('rejects a dirty or relative source worktree', async () => {
   const destination = await mkdtemp(join(tmpdir(), 'verow-contract-destination-'));
 
   await assert.rejects(
-    importBundleContract({ sourceRoot: 'relative/source', destinationRoot: destination }),
+    importBundleContract({
+      sourceRoot: 'relative/source',
+      destinationRoot: destination,
+    }),
     /absolute/u,
   );
   await writeFile(join(source.generated, 'migration-bundle.schema.json'), '{"dirty":true}\n');
   await assert.rejects(
-    importBundleContract({ sourceRoot: source.root, destinationRoot: destination }),
+    importBundleContract({
+      sourceRoot: source.root,
+      destinationRoot: destination,
+    }),
     /clean/u,
   );
   await assert.rejects(readFile(join(destination, 'migration-bundle.schema.json')));
@@ -69,19 +79,26 @@ test('rejects a dirty or relative source worktree', async () => {
 
 test('freezes an exact registry and integrity runtime closure for publication', async () => {
   const packageJson = JSON.parse(await readFile(join(packageRoot, 'package.json'), 'utf8'));
-  const shrinkwrap = JSON.parse(
-    await readFile(join(packageRoot, 'npm-shrinkwrap.json'), 'utf8'),
-  );
+  const shrinkwrap = JSON.parse(await readFile(join(packageRoot, 'npm-shrinkwrap.json'), 'utf8'));
 
   assert.equal(shrinkwrap.lockfileVersion, 3);
   assert.equal(shrinkwrap.name, packageJson.name);
   assert.equal(shrinkwrap.version, packageJson.version);
+  assert.equal(shrinkwrap.packages[''].name, packageJson.name);
+  assert.equal(shrinkwrap.packages[''].version, packageJson.version);
   assert.deepEqual(shrinkwrap.packages[''].dependencies, packageJson.dependencies);
   for (const [name, version] of Object.entries(packageJson.dependencies)) {
     assert.match(version, /^\d+\.\d+\.\d+$/u, `${name} must use an exact version`);
   }
-  for (const [path, entry] of Object.entries(shrinkwrap.packages)) {
+  const reachable = reachableRuntimePackages(shrinkwrap.packages);
+  assert.deepEqual(
+    [...reachable].sort(),
+    Object.keys(shrinkwrap.packages).sort(),
+    'shrinkwrap must contain exactly the reachable runtime closure',
+  );
+  for (const path of reachable) {
     if (path === '') continue;
+    const entry = shrinkwrap.packages[path];
     assert.match(
       entry.resolved,
       /^https:\/\/registry\.npmjs\.org\//u,
@@ -90,3 +107,52 @@ test('freezes an exact registry and integrity runtime closure for publication', 
     assert.match(entry.integrity, /^sha512-/u, `${path} must pin integrity`);
   }
 });
+
+test('includes npm-shrinkwrap.json in the actual package contents', async () => {
+  const { stdout } = await exec('npm', ['pack', '--dry-run', '--json', '--ignore-scripts'], {
+    cwd: packageRoot,
+    maxBuffer: 10 * 1024 * 1024,
+  });
+  const [packed] = JSON.parse(stdout);
+
+  assert.ok(
+    packed.files.some(({ path }) => path === 'npm-shrinkwrap.json'),
+    'packed package must include npm-shrinkwrap.json',
+  );
+});
+
+function reachableRuntimePackages(packages) {
+  const reachable = new Set();
+  const pending = [''];
+  while (pending.length > 0) {
+    const path = pending.pop();
+    if (path === undefined || reachable.has(path)) continue;
+    const entry = packages[path];
+    assert.ok(entry, `missing shrinkwrap entry ${path || '<root>'}`);
+    reachable.add(path);
+    for (const [name] of Object.entries({
+      ...entry.dependencies,
+      ...entry.optionalDependencies,
+    })) {
+      const resolved = resolveLockedDependency(packages, path, name);
+      assert.ok(resolved, `${path || '<root>'} dependency ${name} must be frozen`);
+      pending.push(resolved);
+    }
+    for (const name of Object.keys(entry.peerDependencies ?? {})) {
+      const resolved = resolveLockedDependency(packages, path, name);
+      if (resolved) pending.push(resolved);
+    }
+  }
+  return reachable;
+}
+
+function resolveLockedDependency(packages, parentPath, name) {
+  let base = parentPath;
+  while (true) {
+    const candidate = base ? `${base}/node_modules/${name}` : `node_modules/${name}`;
+    if (packages[candidate]) return candidate;
+    if (!base) return null;
+    const nestedMarker = base.lastIndexOf('/node_modules/');
+    base = nestedMarker === -1 ? '' : base.slice(0, nestedMarker);
+  }
+}

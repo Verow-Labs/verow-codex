@@ -48,8 +48,63 @@ describe('source inventory', () => {
     expect(first.files.map(({ path }) => path)).toEqual(
       [...first.files.map(({ path }) => path)].sort(),
     );
-    expect(first.files.every(({ digest }) => /^sha256:[0-9a-f]{64}$/u.test(digest))).toBe(
-      true,
-    );
+    expect(first.files.every(({ digest }) => /^sha256:[0-9a-f]{64}$/u.test(digest))).toBe(true);
+  });
+
+  it('orders Unicode output by code point without locale collation', async () => {
+    const unicodeRoot = '/synthetic/unicode';
+    const unicodeReader: WorkspaceReader = {
+      async realpath(path) {
+        return path;
+      },
+      async readDirectory(path) {
+        if (path === unicodeRoot) {
+          return [
+            { name: 'package.json', kind: 'file' },
+            { name: 'app', kind: 'directory' },
+            { name: '.openai', kind: 'directory' },
+          ];
+        }
+        if (path === `${unicodeRoot}/.openai`) {
+          return [{ name: 'hosting.json', kind: 'file' }];
+        }
+        if (path === `${unicodeRoot}/app`) {
+          return [
+            { name: 'éclair', kind: 'directory' },
+            { name: 'zeta', kind: 'directory' },
+          ];
+        }
+        if (path === `${unicodeRoot}/app/zeta` || path === `${unicodeRoot}/app/éclair`) {
+          return [{ name: 'page.tsx', kind: 'file' }];
+        }
+        return [];
+      },
+      async readFile(path) {
+        if (path.endsWith('hosting.json')) return Buffer.from('{"d1":null,"r2":null}');
+        if (path.endsWith('package.json')) {
+          return Buffer.from(
+            '{"dependencies":{"éclair-analytics":"1.0.0","zeta-analytics":"1.0.0"}}',
+          );
+        }
+        return Buffer.from(`<main>${path.includes('zeta') ? 'Zeta' : 'Éclair'}</main>`);
+      },
+    };
+
+    const result = await analyzeSitesSource({
+      root: unicodeRoot,
+      reader: unicodeReader,
+    });
+
+    expect(result.files.map(({ path }) => path).filter((path) => path.startsWith('app/'))).toEqual([
+      'app/zeta/page.tsx',
+      'app/éclair/page.tsx',
+    ]);
+    expect(result.routes).toEqual(['/zeta', '/éclair']);
+    expect(
+      result.contentCandidates
+        .filter(({ sourceKind }) => sourceKind === 'jsx')
+        .map(({ path }) => path),
+    ).toEqual(['app/zeta/page.tsx', 'app/éclair/page.tsx']);
+    expect(result.integrations).toEqual(['zeta-analytics', 'éclair-analytics']);
   });
 });
