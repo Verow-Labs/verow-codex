@@ -310,12 +310,27 @@ function dependencyTargetsRemovedHostingPackage(name: string, specifier: unknown
   return alias !== null && isRemovedHostingPackage(alias.target);
 }
 
+function scriptPackageIdentity(token: string): string {
+  if (token.startsWith('@')) {
+    const scopeSeparator = token.indexOf('/');
+    const selectorSeparator = token.indexOf('@', scopeSeparator + 1);
+    return scopeSeparator > 1 && selectorSeparator > scopeSeparator
+      ? token.slice(0, selectorSeparator)
+      : token;
+  }
+  const selectorSeparator = token.indexOf('@');
+  return selectorSeparator > 0 ? token.slice(0, selectorSeparator) : token;
+}
+
 function invokesRemovedTool(command: string, removedScriptNames: ReadonlySet<string>): boolean {
   const tokens = command.match(/[^\s;&|()'"`]+/gu) ?? [];
   for (const originalToken of tokens) {
     const token = originalToken.replace(/,+$/u, '').replaceAll('\\', '/');
-    if (isRemovedHostingPackage(token) || removedHostingBinaries.has(token)) return true;
-    const binaryName = token.split('/').at(-1) ?? '';
+    const packageIdentity = scriptPackageIdentity(token);
+    if (isRemovedHostingPackage(packageIdentity) || removedHostingBinaries.has(packageIdentity)) {
+      return true;
+    }
+    const binaryName = scriptPackageIdentity(token.split('/').at(-1) ?? '');
     if (removedHostingBinaries.has(binaryName)) return true;
     if (token.startsWith('vite-plugin-') || token.startsWith('@vitejs/')) return true;
     const nodeModulesIndex = token.lastIndexOf('node_modules/');

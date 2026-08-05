@@ -225,6 +225,53 @@ describe('native Next hosting-toolchain conversion', () => {
     expect((candidate.packageJson.scripts as Record<string, string>).lint).toBe('eslint .');
   });
 
+  it.each([
+    ['npx unscoped range', 'npx vite@7.3.1 build'],
+    ['quoted npx scoped tag', 'sh -c "npx @opennextjs/cloudflare@latest build"'],
+    ['npm exec unscoped tag', 'npm exec vite@latest -- build'],
+    ['npm exec scoped range', 'npm exec -- @cloudflare/next-on-pages@1.13.16'],
+    ['pnpm dlx unscoped range', 'pnpm dlx vinext@0.0.11 build'],
+    ['pnpm dlx scoped tag', 'pnpm dlx @opennextjs/cloudflare@latest build'],
+    ['pnpm exec unscoped range', 'pnpm exec wrangler@4.61.1 deploy'],
+    ['pnpm exec scoped range', 'pnpm exec @cloudflare/next-on-pages@1.13.16'],
+    ['yarn dlx unscoped range', 'yarn dlx vite@7.3.1 build'],
+    ['yarn dlx scoped tag', 'yarn dlx @cloudflare/vite-plugin@latest'],
+    ['bunx unscoped range', 'bunx vite-tsconfig-paths@5.1.4'],
+    ['bunx scoped tag', 'bunx @opennextjs/cloudflare@latest build'],
+    ['quoted Vite plugin tag', 'sh -c "npx @vitejs/plugin-react@latest"'],
+  ])('removes a hosting script selected through %s', async (_kind, command) => {
+    const sourceRoot = await fixtureCopy();
+    await mutateJsonFile(join(sourceRoot, 'package.json'), (packageJson) => {
+      const scripts = packageJson.scripts as Record<string, string>;
+      scripts['versioned-tool'] = command;
+      scripts['safe-versioned-tool'] = 'npx eslint@9.0.0 .';
+    });
+    const analysis = await analyze(sourceRoot);
+    const { candidate } = await convertFixture({ sourceRoot, analysis });
+    const scripts = candidate.packageJson.scripts as Record<string, string>;
+
+    expect(scripts['versioned-tool']).toBeUndefined();
+    expect(scripts['safe-versioned-tool']).toBe('npx eslint@9.0.0 .');
+  });
+
+  it('removes script chains that terminate in a version-qualified hosting selector', async () => {
+    const sourceRoot = await fixtureCopy();
+    await mutateJsonFile(join(sourceRoot, 'package.json'), (packageJson) => {
+      const scripts = packageJson.scripts as Record<string, string>;
+      scripts['versioned-tool'] = 'sh -c "npx vite@7.3.1 build"';
+      scripts['versioned-chain'] = 'pnpm run versioned-tool';
+      scripts['versioned-chain-outer'] = 'bun run versioned-chain';
+    });
+    const analysis = await analyze(sourceRoot);
+    const { candidate } = await convertFixture({ sourceRoot, analysis });
+    const scripts = candidate.packageJson.scripts as Record<string, string>;
+
+    expect(scripts['versioned-tool']).toBeUndefined();
+    expect(scripts['versioned-chain']).toBeUndefined();
+    expect(scripts['versioned-chain-outer']).toBeUndefined();
+    expect(scripts.lint).toBe('eslint .');
+  });
+
   it('emits sorted output paths, stable preserved digests, and a content-free ordered receipt', async () => {
     const { analysis, candidate } = await convertFixture();
     const receiptPaths = candidate.mutations.map(({ path }) => path);
