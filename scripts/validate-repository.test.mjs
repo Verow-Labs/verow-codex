@@ -5,6 +5,7 @@ import test from 'node:test';
 test('publishes one correctly governed verow plugin', async () => {
   const marketplace = JSON.parse(await readFile('.agents/plugins/marketplace.json'));
   assert.equal(marketplace.name, 'verow');
+  assert.equal(marketplace.plugins.length, 1);
   assert.deepEqual(marketplace.plugins[0], {
     name: 'verow',
     source: { source: 'local', path: './plugins/verow' },
