@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "verow": {
+      "type": "http",
+      "url": "https://mcp.verow.io/mcp",
+      "oauth_resource": "https://mcp.verow.io/mcp"
+    }
+  }
+}

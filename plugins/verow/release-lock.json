@@ -1,0 +1,58 @@
+{
+  "version": "verow-codex.release.v1",
+  "rollout": {
+    "mode": "disabled"
+  },
+  "channels": {
+    "stable": "v1.0.0",
+    "beta": null
+  },
+  "git": {
+    "repository": "Verow-Labs/verow-codex",
+    "tag": "v1.0.0",
+    "compilerSourceCommit": null
+  },
+  "compatibility": {
+    "node": ">=24.0.0",
+    "codexCli": ">=0.146.0-alpha.9.2"
+  },
+  "sites": {
+    "marketplace": "openai-bundled",
+    "version": "0.1.33"
+  },
+  "superpowers": {
+    "marketplace": "openai-curated",
+    "version": "5.1.3"
+  },
+  "verow": {
+    "marketplace": "verow",
+    "version": "1.0.0"
+  },
+  "contracts": {
+    "bundleVersion": "move-to-verow.bundle.v1",
+    "manifestVersion": "move-to-verow.manifest.v1",
+    "payloadIndexVersion": "move-to-verow.payload-index.v1",
+    "bundleSchemaDigest": null,
+    "canonicalVectorsDigest": null,
+    "webappCommit": null
+  },
+  "assets": {
+    "sourceRepository": "Verow-Labs/verow-webapp",
+    "sourceCommit": "818e9bd5484e9bdae3ab2430978921b7dc952898",
+    "files": {
+      "verow-icon-dark.png": "sha256:a3cc5dbd7a864dc64aa10344c7a5cde36a4fef5aeda3e588a90edb61e2020a88",
+      "verow-icon-light.png": "sha256:28af87d41c48e407c5bf607baa5f69f3c2c33ad9828192504a5d33aaa654f784",
+      "verow-logo.png": "sha256:ad6c5bf290df54e54790ce201144327620f840630049a911f7743bd11376dcce",
+      "verow-logo-black.png": "sha256:ad6c5bf290df54e54790ce201144327620f840630049a911f7743bd11376dcce"
+    }
+  },
+  "packages": {
+    "@verow/move-to-verow-compiler": {
+      "version": "1.0.0",
+      "integrity": null,
+      "executableDigest": null,
+      "runtimeClosureDigest": null,
+      "browserRevision": null
+    }
+  }
+}

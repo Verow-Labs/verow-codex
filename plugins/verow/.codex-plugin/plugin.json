@@ -1,0 +1,37 @@
+{
+  "name": "verow",
+  "version": "1.0.0",
+  "description": "Move finished Codex Sites websites into Verow and operate the managed workflow.",
+  "author": {
+    "name": "Verow",
+    "email": "support@verow.io",
+    "url": "https://www.verow.io"
+  },
+  "homepage": "https://www.verow.io",
+  "repository": "https://github.com/Verow-Labs/verow-codex",
+  "license": "UNLICENSED",
+  "keywords": ["verow", "websites", "migration", "nextjs", "sanity", "vercel"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Verow",
+    "shortDescription": "Move and manage agency websites with Verow",
+    "longDescription": "Convert finished Codex Sites projects into verified Next.js websites managed through Verow, GitHub, Vercel, and Sanity.",
+    "developerName": "Verow",
+    "category": "Coding",
+    "capabilities": ["Interactive", "Read", "Write"],
+    "websiteURL": "https://www.verow.io",
+    "privacyPolicyURL": "https://app.verow.io/privacy-policy",
+    "termsOfServiceURL": "https://app.verow.io/terms-of-service",
+    "defaultPrompt": [
+      "Move this finished Sites website to Verow.",
+      "Check whether this workspace is ready for Verow.",
+      "Diagnose my Verow Codex setup."
+    ],
+    "brandColor": "#111111",
+    "composerIcon": "./assets/verow-icon-dark.png",
+    "logo": "./assets/verow-logo-black.png",
+    "logoDark": "./assets/verow-logo.png",
+    "screenshots": []
+  },
+  "mcpServers": "./.mcp.json"
+}
