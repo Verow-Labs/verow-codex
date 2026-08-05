@@ -1,7 +1,8 @@
 import { createHash } from 'node:crypto';
 import { constants } from 'node:fs';
-import { lstat, mkdir, open, readdir, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, open, readdir, realpath } from 'node:fs/promises';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { satisfies } from 'semver';
 
 import type { SitesSourceAnalysis } from './admission.js';
 import {
@@ -10,6 +11,7 @@ import {
   makeInventoriedFile,
   type InventoriedFile,
 } from './inventory.js';
+import { classifySitesHostingShim } from './hosting-shims.js';
 
 type Sha256Digest = `sha256:${string}`;
 
@@ -68,6 +70,7 @@ const rootLockManifestFields = [
 
 const removedHostingPackages = new Set([
   '@cloudflare/next-on-pages',
+  '@cloudflare/vinext',
   '@cloudflare/vite-plugin',
   '@cloudflare/workers-types',
   '@opennextjs/cloudflare',
@@ -142,19 +145,28 @@ async function assertRoots(input: ConvertToNativeNextInput): Promise<{
   if (!isAbsolute(input.sourceRoot) || !isAbsolute(input.outputRoot)) {
     throw new TypeError('source and output roots must be absolute');
   }
-  const sourceRoot = resolve(input.sourceRoot);
-  const outputRoot = resolve(input.outputRoot);
-  if (sourceRoot === outputRoot) throw new Error('source and output roots must be distinct');
-  if (isNested(sourceRoot, outputRoot) || isNested(outputRoot, sourceRoot)) {
-    throw new Error('source and output roots must not be nested');
-  }
+  const requestedSourceRoot = resolve(input.sourceRoot);
+  const requestedOutputRoot = resolve(input.outputRoot);
 
-  const [sourceStat, outputStat] = await Promise.all([lstat(sourceRoot), lstat(outputRoot)]);
+  const [sourceStat, outputStat] = await Promise.all([
+    lstat(requestedSourceRoot),
+    lstat(requestedOutputRoot),
+  ]);
   if (sourceStat.isSymbolicLink() || outputStat.isSymbolicLink()) {
     throw new Error('source and output roots must not be symlinks');
   }
   if (!sourceStat.isDirectory() || !outputStat.isDirectory()) {
     throw new Error('source and output roots must be directories');
+  }
+  const [sourceRoot, outputRoot] = await Promise.all([
+    realpath(requestedSourceRoot),
+    realpath(requestedOutputRoot),
+  ]);
+  if (sourceRoot === outputRoot) {
+    throw new Error('canonical source and output roots must be distinct');
+  }
+  if (isNested(sourceRoot, outputRoot) || isNested(outputRoot, sourceRoot)) {
+    throw new Error('canonical source and output roots must not be nested');
   }
   if ((await readdir(outputRoot)).length !== 0) {
     throw new Error('compiler-owned output root must be empty');
@@ -262,15 +274,54 @@ function isRemovedHostingPackage(name: string): boolean {
   );
 }
 
-function invokesRemovedTool(command: string, removedScriptNames: ReadonlySet<string>): boolean {
+interface NpmAliasSpecifier {
+  target: string;
+  range: string;
+}
+
+function parseNpmAliasSpecifier(specifier: string): NpmAliasSpecifier | null {
+  if (!specifier.startsWith('npm:')) return null;
+  const alias = specifier.slice(4);
+  const separator = alias.startsWith('@') ? alias.lastIndexOf('@') : alias.indexOf('@');
+  const target = separator > 0 ? alias.slice(0, separator) : alias;
+  const range = separator > 0 ? alias.slice(separator + 1) : '*';
   if (
-    /(?:^|[\s;&|()])(?:npx\s+)?(?:vinext|vite|wrangler)(?=$|[\s;&|()])/u.test(command)
+    target === '' ||
+    range === '' ||
+    !(target.startsWith('@') ? /^@[^/\s]+\/[^/\s]+$/u : /^[^/@\s]+$/u.test(target))
   ) {
-    return true;
+    throw new Error(`unsupported npm alias specifier: ${specifier}`);
+  }
+  return { target, range };
+}
+
+function dependencyTargetsRemovedHostingPackage(name: string, specifier: unknown): boolean {
+  if (isRemovedHostingPackage(name)) return true;
+  if (typeof specifier !== 'string') return false;
+  const alias = parseNpmAliasSpecifier(specifier);
+  return alias !== null && isRemovedHostingPackage(alias.target);
+}
+
+function invokesRemovedTool(command: string, removedScriptNames: ReadonlySet<string>): boolean {
+  const tokens = command.match(/"[^"]*"|'[^']*'|[^\s;&|()]+/gu) ?? [];
+  for (const originalToken of tokens) {
+    const token = originalToken.replace(/^["']|["'],?$/gu, '').replaceAll('\\', '/');
+    if (isRemovedHostingPackage(token) || /^(?:vinext|vite|wrangler)$/u.test(token)) return true;
+    if (token.startsWith('vite-plugin-') || token.startsWith('@vitejs/')) return true;
+    const nodeModulesIndex = token.lastIndexOf('node_modules/');
+    if (nodeModulesIndex >= 0) {
+      const packagePath = token.slice(nodeModulesIndex + 'node_modules/'.length);
+      const withoutBin = packagePath.startsWith('.bin/') ? packagePath.slice(5) : packagePath;
+      const segments = withoutBin.split('/');
+      const packageName = withoutBin.startsWith('@')
+        ? segments.slice(0, 2).join('/')
+        : (segments[0] ?? '');
+      if (isRemovedHostingPackage(packageName)) return true;
+    }
   }
   for (const name of removedScriptNames) {
     const escaped = name.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
-    if (new RegExp(`(?:npm|pnpm|yarn)\\s+(?:run\\s+)?${escaped}(?=$|[\\s;&|()])`, 'u').test(command)) {
+    if (new RegExp(`(?:npm|pnpm|yarn|bun)\\s+(?:run\\s+)?${escaped}(?=$|[\\s;&|()])`, 'u').test(command)) {
       return true;
     }
   }
@@ -298,7 +349,7 @@ function rewritePackageJson(bytes: Uint8Array): {
     if (section === undefined) continue;
     if (!isPlainObject(section)) throw new Error(`package.json ${sectionName} must be an object`);
     for (const name of Object.keys(section)) {
-      if (isRemovedHostingPackage(name)) delete section[name];
+      if (dependencyTargetsRemovedHostingPackage(name, section[name])) delete section[name];
     }
   }
 
@@ -378,6 +429,54 @@ function dependencyMap(entry: Record<string, unknown>, section: string): Record<
   return result;
 }
 
+function isOptionalPeer(entry: Record<string, unknown>, name: string): boolean {
+  const metadata = entry.peerDependenciesMeta;
+  if (metadata === undefined) return false;
+  if (!isPlainObject(metadata)) throw new Error('package-lock peerDependenciesMeta must be an object');
+  const peer = metadata[name];
+  if (peer === undefined) return false;
+  if (!isPlainObject(peer)) throw new Error(`package-lock peer metadata is malformed: ${name}`);
+  return peer.optional === true;
+}
+
+function registryPackageIdentity(resolved: string): string | null {
+  try {
+    const url = new URL(resolved);
+    if (url.origin !== 'https://registry.npmjs.org') return null;
+    const marker = url.pathname.indexOf('/-/');
+    if (marker < 0) return null;
+    const encoded = url.pathname.slice(1, marker);
+    return decodeURIComponent(encoded).replace('%2f', '/');
+  } catch {
+    return null;
+  }
+}
+
+function lockedPackageIdentity(path: string, entry: Record<string, unknown>): string {
+  if (typeof entry.name === 'string' && entry.name !== '') return entry.name;
+  if (typeof entry.resolved === 'string') {
+    const registryIdentity = registryPackageIdentity(entry.resolved);
+    if (registryIdentity !== null) return registryIdentity;
+  }
+  return lockPackageName(path);
+}
+
+function specifierRange(specifier: string): { range: string; aliasTarget: string | null } {
+  const alias = parseNpmAliasSpecifier(specifier);
+  return alias === null
+    ? { range: specifier, aliasTarget: null }
+    : { range: alias.range, aliasTarget: alias.target };
+}
+
+function versionSatisfiesSpecifier(version: string, specifier: string): boolean {
+  const { range } = specifierRange(specifier);
+  try {
+    return satisfies(version, range, { includePrerelease: false, loose: false });
+  } catch {
+    return false;
+  }
+}
+
 function assertSafeLockPackagePath(path: string): void {
   if (
     path !== '' &&
@@ -418,7 +517,7 @@ function rewritePackageLock(
     const entry = packages[path];
     if (!isPlainObject(entry)) throw new Error(`package-lock entry is malformed: ${path}`);
     if (path !== '') {
-      const packageName = lockPackageName(path);
+      const packageName = lockedPackageIdentity(path, entry);
       if (isRemovedHostingPackage(packageName)) {
         throw new Error(`removed hosting tool remains reachable in package-lock: ${packageName}`);
       }
@@ -446,17 +545,55 @@ function rewritePackageLock(
     const optionalDependencies = dependencyMap(entry, 'optionalDependencies');
     const peerDependencies = dependencyMap(entry, 'peerDependencies');
     const edges = [
-      ...Object.keys(requiredDependencies).map((name) => ({ name, optional: false })),
-      ...Object.keys(optionalDependencies).map((name) => ({ name, optional: true })),
-      ...Object.keys(peerDependencies).map((name) => ({ name, optional: true })),
+      ...Object.entries(requiredDependencies).map(([name, specifier]) => ({
+        name,
+        specifier,
+        optional: false,
+        peer: false,
+      })),
+      ...Object.entries(optionalDependencies).map(([name, specifier]) => ({
+        name,
+        specifier,
+        optional: true,
+        peer: false,
+      })),
+      ...Object.entries(peerDependencies).map(([name, specifier]) => ({
+        name,
+        specifier,
+        optional: isOptionalPeer(entry, name),
+        peer: true,
+      })),
     ].sort((left, right) => compareCodePointStrings(left.name, right.name));
     for (const edge of edges) {
+      const alias = specifierRange(edge.specifier);
+      if (alias.aliasTarget !== null && isRemovedHostingPackage(alias.aliasTarget)) {
+        throw new Error(`removed hosting tool remains reachable through npm alias: ${alias.aliasTarget}`);
+      }
       const dependencyPath = resolveLockDependency(packages, path, edge.name);
       if (dependencyPath === null) {
         if (!edge.optional) {
-          throw new Error(`package-lock is missing reachable dependency ${edge.name} from ${path}`);
+          const kind = edge.peer ? 'required peer' : 'required dependency';
+          throw new Error(`package-lock is missing ${kind} ${edge.name} from ${path}`);
         }
         continue;
+      }
+      const dependencyEntry = packages[dependencyPath];
+      if (!isPlainObject(dependencyEntry) || typeof dependencyEntry.version !== 'string') {
+        throw new Error(`package-lock dependency entry is malformed: ${dependencyPath}`);
+      }
+      if (!versionSatisfiesSpecifier(dependencyEntry.version, edge.specifier)) {
+        throw new Error(
+          `${dependencyPath} version ${dependencyEntry.version} does not satisfy ${edge.specifier}`,
+        );
+      }
+      const actualIdentity = lockedPackageIdentity(dependencyPath, dependencyEntry);
+      if (isRemovedHostingPackage(actualIdentity)) {
+        throw new Error(`removed hosting tool remains reachable: ${actualIdentity}`);
+      }
+      if (alias.aliasTarget !== null && actualIdentity !== alias.aliasTarget) {
+        throw new Error(
+          `package-lock alias ${edge.name} resolves ${actualIdentity} instead of ${alias.aliasTarget}`,
+        );
       }
       if (!reachable.has(dependencyPath)) {
         reachable.add(dependencyPath);
@@ -473,18 +610,67 @@ function rewritePackageLock(
   return canonicalJson(lock);
 }
 
-function isHostingOnlyPath(path: string): boolean {
-  return hostingOnlyPaths.has(path) || /^vite\.config\.(?:[cm]?[jt]s)$/u.test(path);
+function isHostingOnlyFile(file: InventoriedFile): boolean {
+  return (
+    hostingOnlyPaths.has(file.path) ||
+    /^vite\.config\.(?:[cm]?[jt]s)$/u.test(file.path) ||
+    classifySitesHostingShim(file.path, file.content) === 'known_shim'
+  );
 }
 
-async function writeOutputFiles(
+async function assertCanonicalOutputDirectory(
+  outputRoot: string,
+  directory: string,
+): Promise<void> {
+  const stat = await lstat(directory);
+  if (stat.isSymbolicLink() || !stat.isDirectory()) {
+    throw new Error(`output parent must remain a real directory: ${directory}`);
+  }
+  const canonical = await realpath(directory);
+  if (canonical !== outputRoot && !isNested(outputRoot, canonical)) {
+    throw new Error(`output parent escaped canonical output root: ${directory}`);
+  }
+}
+
+async function createOutputParent(outputRoot: string, path: string): Promise<string> {
+  await assertCanonicalOutputDirectory(outputRoot, outputRoot);
+  const segments = path.split('/').slice(0, -1);
+  let directory = outputRoot;
+  for (const segment of segments) {
+    directory = join(directory, segment);
+    try {
+      await mkdir(directory);
+    } catch (error) {
+      if (!isPlainObject(error) || error.code !== 'EEXIST') throw error;
+    }
+    await assertCanonicalOutputDirectory(outputRoot, directory);
+  }
+  return directory;
+}
+
+/** @internal */
+export async function writeOutputFiles(
   outputRoot: string,
   files: ReadonlyMap<string, Uint8Array>,
 ): Promise<void> {
   for (const path of [...files.keys()].sort(compareCodePointStrings)) {
     const absolutePath = join(outputRoot, ...path.split('/'));
-    await mkdir(resolve(absolutePath, '..'), { recursive: true });
-    await writeFile(absolutePath, files.get(path) ?? new Uint8Array(), { flag: 'wx' });
+    const parent = await createOutputParent(outputRoot, path);
+    const handle = await open(
+      absolutePath,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+      0o600,
+    );
+    try {
+      await assertCanonicalOutputDirectory(outputRoot, parent);
+      const canonicalFile = await realpath(absolutePath);
+      if (!isNested(outputRoot, canonicalFile)) {
+        throw new Error(`output file escaped canonical output root: ${path}`);
+      }
+      await handle.writeFile(files.get(path) ?? new Uint8Array());
+    } finally {
+      await handle.close();
+    }
   }
 }
 
@@ -493,6 +679,14 @@ export async function convertToNativeNext(
 ): Promise<NativeNextCandidate> {
   const { sourceRoot, outputRoot } = await assertRoots(input);
   const sourceFiles = await verifyAuthorizationSnapshot(sourceRoot, input.analysis);
+  for (const file of sourceFiles) {
+    const shim = classifySitesHostingShim(file.path, file.content);
+    const workerPath =
+      file.path.startsWith('worker/') || /(?:^|\/)worker\.[cm]?[jt]s$/u.test(file.path);
+    if (shim === 'unsafe_shim' || (workerPath && shim !== 'known_shim')) {
+      throw new Error(`source analysis contains unsupported Worker behavior: ${file.path}`);
+    }
+  }
   const sourceByPath = new Map(sourceFiles.map((file) => [file.path, file]));
   const packageFile = sourceByPath.get('package.json');
   const lockFile = sourceByPath.get('package-lock.json');
@@ -506,7 +700,7 @@ export async function convertToNativeNext(
   const mutations: NativeNextMutation[] = [];
 
   for (const file of sourceFiles) {
-    if (isHostingOnlyPath(file.path)) {
+    if (isHostingOnlyFile(file)) {
       mutations.push({ path: file.path, action: 'removed', beforeDigest: file.digest });
       continue;
     }

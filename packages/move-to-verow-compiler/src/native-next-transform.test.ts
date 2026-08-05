@@ -13,7 +13,7 @@ import {
   writeFile,
 } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { afterEach, describe, expect, it } from 'vitest';
 
@@ -23,7 +23,7 @@ import {
   type WorkspaceReader,
 } from './admission.js';
 import { compareCodePointStrings } from './inventory.js';
-import { convertToNativeNext } from './native-next-transform.js';
+import { convertToNativeNext, writeOutputFiles } from './native-next-transform.js';
 
 const execFile = promisify(execFileCallback);
 const fixtureRoot = resolve(import.meta.dirname, '..', 'fixtures', 'sites-multi-route');
@@ -104,6 +104,15 @@ function lockPackageName(path: string): string {
   return leaf.startsWith('@') ? segments.slice(0, 2).join('/') : (segments[0] ?? '');
 }
 
+async function mutateJsonFile(
+  path: string,
+  mutate: (value: Record<string, unknown>) => void,
+): Promise<void> {
+  const value = JSON.parse(await readFile(path, 'utf8')) as Record<string, unknown>;
+  mutate(value);
+  await writeJson(path, value);
+}
+
 describe('native Next hosting-toolchain conversion', () => {
   it('preserves app code and framework versions while removing Sites runtime tooling', async () => {
     const { analysis, candidate, outputRoot } = await convertFixture();
@@ -124,6 +133,8 @@ describe('native Next hosting-toolchain conversion', () => {
     expect(candidate.outputPaths).not.toContain('.openai/hosting.json');
     expect(candidate.outputPaths).not.toContain('vite.config.ts');
     expect(candidate.outputPaths).not.toContain('wrangler.jsonc');
+    expect(candidate.outputPaths).not.toContain('worker/index.ts');
+    expect(candidate.outputPaths).not.toContain('build/sites-vite-plugin.ts');
     expect(candidate.preservedDigests['app/page.tsx']).toBeDefined();
     expect(await lstat(join(outputRoot, 'app/page.tsx'))).toMatchObject({});
   });
@@ -202,7 +213,9 @@ describe('native Next hosting-toolchain conversion', () => {
         expect.objectContaining({ path: 'app/page.tsx', action: 'copied' }),
         expect.objectContaining({ path: 'package-lock.json', action: 'rewritten' }),
         expect.objectContaining({ path: 'package.json', action: 'rewritten' }),
+        expect.objectContaining({ path: 'build/sites-vite-plugin.ts', action: 'removed' }),
         expect.objectContaining({ path: 'vite.config.ts', action: 'removed' }),
+        expect.objectContaining({ path: 'worker/index.ts', action: 'removed' }),
         expect.objectContaining({ path: 'wrangler.jsonc', action: 'removed' }),
       ]),
     );
@@ -250,6 +263,39 @@ describe('native Next hosting-toolchain conversion', () => {
         outputRoot: await emptyOutputRoot(),
       }),
     ).rejects.toThrow('admissible');
+  });
+
+  it('compares canonical roots before accepting a symlink-ancestor output path', async () => {
+    const sourceRoot = await fixtureCopy();
+    const physicalOutput = join(sourceRoot, 'compiler-output');
+    await mkdir(physicalOutput);
+    const sourceAlias = join(dirname(sourceRoot), 'source-alias');
+    await symlink(sourceRoot, sourceAlias, 'dir');
+    const analysis = await analyze(sourceRoot);
+
+    await expect(
+      convertToNativeNext({
+        analysis,
+        sourceRoot,
+        outputRoot: join(sourceAlias, 'compiler-output'),
+      }),
+    ).rejects.toThrow(/canonical|nested|distinct/iu);
+    expect(await readdir(physicalOutput)).toEqual([]);
+  });
+
+  it('refuses an output parent replaced by a symlink instead of writing through it', async () => {
+    const outputRoot = await emptyOutputRoot();
+    const escapeRoot = await mkdtemp(join(tmpdir(), 'verow-native-escape-'));
+    temporaryRoots.add(escapeRoot);
+    await symlink(escapeRoot, join(outputRoot, 'public'), 'dir');
+
+    await expect(
+      writeOutputFiles(
+        outputRoot,
+        new Map([['public/fixture-mark.svg', new TextEncoder().encode('blocked')]]),
+      ),
+    ).rejects.toThrow(/output|symlink|canonical/iu);
+    await expect(lstat(join(escapeRoot, 'fixture-mark.svg'))).rejects.toThrow();
   });
 
   it('treats the analysis as an exact authorization snapshot and fails closed on drift', async () => {
@@ -357,6 +403,118 @@ describe('native Next hosting-toolchain conversion', () => {
   });
 
   it.each([
+    ['wrong direct version', 'node_modules/next', '0.0.1'],
+    ['wrong transitive prerelease', 'node_modules/styled-jsx', '5.1.6-beta.1'],
+  ])('rejects a %s that does not satisfy its frozen declaring range', async (_kind, path, version) => {
+    const sourceRoot = await fixtureCopy();
+    await mutateJsonFile(join(sourceRoot, 'package-lock.json'), (lock) => {
+      const packages = lock.packages as Record<string, Record<string, unknown>>;
+      if (packages[path]) packages[path].version = version;
+    });
+    const analysis = await analyze(sourceRoot);
+
+    await expect(
+      convertToNativeNext({ analysis, sourceRoot, outputRoot: await emptyOutputRoot() }),
+    ).rejects.toThrow(/satisf|version|range/iu);
+  });
+
+  it('rejects a missing required peer but permits only explicitly optional absent peers', async () => {
+    const requiredRoot = await fixtureCopy();
+    await mutateJsonFile(join(requiredRoot, 'package-lock.json'), (lock) => {
+      const packages = lock.packages as Record<string, Record<string, unknown>>;
+      const next = packages['node_modules/next'];
+      if (next) {
+        next.peerDependencies = {
+          ...(next.peerDependencies as Record<string, string>),
+          'missing-required-peer': '^1.0.0',
+        };
+      }
+    });
+    const requiredAnalysis = await analyze(requiredRoot);
+    await expect(
+      convertToNativeNext({
+        analysis: requiredAnalysis,
+        sourceRoot: requiredRoot,
+        outputRoot: await emptyOutputRoot(),
+      }),
+    ).rejects.toThrow(/required peer/iu);
+
+    const optionalRoot = await fixtureCopy();
+    await mutateJsonFile(join(optionalRoot, 'package-lock.json'), (lock) => {
+      const packages = lock.packages as Record<string, Record<string, unknown>>;
+      const next = packages['node_modules/next'];
+      if (next) {
+        next.peerDependencies = {
+          ...(next.peerDependencies as Record<string, string>),
+          'missing-optional-peer': '^1.0.0',
+        };
+        next.peerDependenciesMeta = {
+          ...(next.peerDependenciesMeta as Record<string, unknown>),
+          'missing-optional-peer': { optional: true },
+        };
+      }
+    });
+    const optionalAnalysis = await analyze(optionalRoot);
+    await expect(
+      convertToNativeNext({
+        analysis: optionalAnalysis,
+        sourceRoot: optionalRoot,
+        outputRoot: await emptyOutputRoot(),
+      }),
+    ).resolves.toBeDefined();
+  });
+
+  it('removes a direct npm alias whose target is a hosting tool', async () => {
+    const sourceRoot = await fixtureCopy();
+    await mutateJsonFile(join(sourceRoot, 'package.json'), (packageJson) => {
+      const dependencies = packageJson.dependencies as Record<string, string>;
+      dependencies['hidden-vite'] = 'npm:vite@7.3.1';
+    });
+    await mutateJsonFile(join(sourceRoot, 'package-lock.json'), (lock) => {
+      const packages = lock.packages as Record<string, Record<string, unknown>>;
+      const root = packages[''];
+      const dependencies = root?.dependencies as Record<string, string>;
+      dependencies['hidden-vite'] = 'npm:vite@7.3.1';
+      packages['node_modules/hidden-vite'] = {
+        ...packages['node_modules/vite'],
+        name: 'vite',
+      };
+    });
+    const analysis = await analyze(sourceRoot);
+    const { candidate } = await convertFixture({ sourceRoot, analysis });
+
+    expect(
+      (candidate.packageJson.dependencies as Record<string, string>)['hidden-vite'],
+    ).toBeUndefined();
+  });
+
+  it.each([
+    ['alias specifier', 'npm:vite@7.3.1'],
+    ['registry identity', '7.3.1'],
+  ])('rejects a transitive hosting tool hidden by %s', async (_kind, specifier) => {
+    const sourceRoot = await fixtureCopy();
+    await mutateJsonFile(join(sourceRoot, 'package-lock.json'), (lock) => {
+      const packages = lock.packages as Record<string, Record<string, unknown>>;
+      const next = packages['node_modules/next'];
+      if (next) {
+        next.dependencies = {
+          ...(next.dependencies as Record<string, string>),
+          'hidden-hosting-tool': specifier,
+        };
+      }
+      packages['node_modules/hidden-hosting-tool'] = {
+        ...packages['node_modules/vite'],
+        name: 'vite',
+      };
+    });
+    const analysis = await analyze(sourceRoot);
+
+    await expect(
+      convertToNativeNext({ analysis, sourceRoot, outputRoot: await emptyOutputRoot() }),
+    ).rejects.toThrow(/hosting|vite|removed/iu);
+  });
+
+  it.each([
     ['absent', async (root: string) => rm(join(root, 'package-lock.json'))],
     [
       'unsupported',
@@ -417,6 +575,49 @@ describe('native Next hosting-toolchain conversion', () => {
         await readFile(join(first.outputRoot, path)),
       );
     }
+  });
+
+  it('admits only the exact known Sites hosting shims and blocks semantic mutations', async () => {
+    expect((await analyze()).admissible).toBe(true);
+    const mutations: readonly [string, string, (source: string) => string][] = [
+      ['custom route', 'worker/index.ts', (source) => `${source}\nexport const route = '/custom';\n`],
+      [
+        'global network call',
+        'worker/index.ts',
+        (source) => `${source}\nvoid fetch('https://example.invalid');\n`,
+      ],
+      [
+        'non-Vinext import',
+        'worker/index.ts',
+        (source) => `import 'customer-worker';\n${source}`,
+      ],
+      ['arbitrary side effect', 'worker/index.ts', (source) => `${source}\nconsole.log('side effect');\n`],
+      [
+        'unsupported binding',
+        'worker/index.ts',
+        (source) => `${source}\nexport const queueBinding = 'MY_QUEUE';\n`,
+      ],
+      [
+        'changed packaging behavior',
+        'build/sites-vite-plugin.ts',
+        (source) => source.replace('.openai/hosting.json', '.env'),
+      ],
+    ];
+
+    for (const [, path, mutate] of mutations) {
+      const sourceRoot = await fixtureCopy();
+      const absolutePath = join(sourceRoot, path);
+      await writeFile(absolutePath, mutate(await readFile(absolutePath, 'utf8')));
+      const result = await analyze(sourceRoot);
+      expect(result.blockers).toContainEqual({ code: 'worker_runtime', path });
+    }
+
+    const alternateRoot = await fixtureCopy();
+    await writeFile(join(alternateRoot, 'worker/alternate.ts'), 'export default {};\n');
+    expect((await analyze(alternateRoot)).blockers).toContainEqual({
+      code: 'worker_runtime',
+      path: 'worker/alternate.ts',
+    });
   });
 
   it.runIf(process.env.VEROW_RUN_TRUSTED_FIXTURE_BUILD === '1')(

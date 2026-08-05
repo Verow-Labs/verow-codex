@@ -19,6 +19,7 @@
     "ajv": "8.20.0",
     "playwright": "1.60.0",
     "postcss": "8.5.15",
+    "semver": "7.8.5",
     "sharp": "0.34.5",
     "tar-stream": "3.2.0",
     "typescript": "5.9.3",

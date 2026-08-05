@@ -188,6 +188,94 @@ describe('Codex Sites admission', () => {
     await expect(analyzeSitesSource({ root: 'relative/site', reader })).rejects.toThrow('absolute');
     expect(touched).toBe(false);
   });
+
+  it('admits only deliberately minimal Wrangler hosting metadata', async () => {
+    const root = '/synthetic/minimal-wrangler';
+    const files = new Map([
+      [`${root}/.openai/hosting.json`, '{"framework":"vinext"}'],
+      [`${root}/app/page.tsx`, 'export default function Page() { return <main>Safe</main>; }'],
+      [`${root}/package.json`, '{"dependencies":{"next":"16.2.6"}}'],
+      [
+        `${root}/wrangler.jsonc`,
+        '{ // hosting metadata only\n "name": "site", "compatibility_date": "2026-08-05",\n}',
+      ],
+    ]);
+
+    const result = await analyzeSitesSource({ root, reader: readerForFiles(files) });
+
+    expect(result.blockers.map(({ code }) => code)).not.toContain('worker_runtime');
+  });
+
+  it.each([
+    'main',
+    'vars',
+    'd1_databases',
+    'r2_buckets',
+    'kv_namespaces',
+    'durable_objects',
+    'services',
+    'queues',
+    'vectorize',
+    'hyperdrive',
+    'analytics_engine_datasets',
+    'dispatch_namespaces',
+    'ai',
+    'ai_search',
+    'browser',
+    'images',
+    'workflows',
+    'tail_consumers',
+    'send_email',
+    'mtls_certificates',
+    'secrets_store_secrets',
+    'pipelines',
+    'containers',
+    'unsafe',
+  ])('blocks environment-qualified Wrangler runtime key %s', async (runtimeKey) => {
+    const root = `/synthetic/wrangler-${runtimeKey}`;
+    const files = new Map([
+      [`${root}/.openai/hosting.json`, '{"framework":"vinext"}'],
+      [`${root}/app/page.tsx`, 'export default function Page() { return <main>Safe</main>; }'],
+      [`${root}/package.json`, '{"dependencies":{"next":"16.2.6"}}'],
+      [
+        `${root}/wrangler.jsonc`,
+        JSON.stringify({
+          name: 'site',
+          compatibility_date: '2026-08-05',
+          env: { production: { [runtimeKey]: runtimeKey === 'main' ? 'worker.ts' : [] } },
+        }),
+      ],
+    ]);
+
+    const result = await analyzeSitesSource({ root, reader: readerForFiles(files) });
+
+    expect(result.blockers).toContainEqual({ code: 'worker_runtime', path: 'wrangler.jsonc' });
+  });
+
+  it.each([
+    ['TOML array table', 'name = "site"\n[[env.production.d1_databases]]\nbinding = "DB"\n'],
+    [
+      'TOML workflows table',
+      'name = "site"\n[env.production.workflows]\nbinding = "WORKFLOW"\n',
+    ],
+    ['unknown JSON structure', '{"name":"site","future_runtime_binding":{}}'],
+  ])('fails closed for %s Wrangler configuration', async (_label, configuration) => {
+    const root = '/synthetic/wrangler-fail-closed';
+    const extension = configuration.startsWith('{') ? 'jsonc' : 'toml';
+    const files = new Map([
+      [`${root}/.openai/hosting.json`, '{"framework":"vinext"}'],
+      [`${root}/app/page.tsx`, 'export default function Page() { return <main>Safe</main>; }'],
+      [`${root}/package.json`, '{"dependencies":{"next":"16.2.6"}}'],
+      [`${root}/wrangler.${extension}`, configuration],
+    ]);
+
+    const result = await analyzeSitesSource({ root, reader: readerForFiles(files) });
+
+    expect(result.blockers).toContainEqual({
+      code: 'worker_runtime',
+      path: `wrangler.${extension}`,
+    });
+  });
 });
 
 function readerForFiles(files: ReadonlyMap<string, string>): WorkspaceReader {

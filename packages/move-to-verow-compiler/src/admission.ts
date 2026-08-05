@@ -12,6 +12,8 @@ import {
   type ContentCandidate,
   type InventoriedFile,
 } from './inventory.js';
+import { classifySitesHostingShim } from './hosting-shims.js';
+import { isMinimalHostingOnlyWranglerConfig } from './wrangler-policy.js';
 
 export type SourceBlockerCode =
   | 'not_codex_sites'
@@ -255,23 +257,28 @@ function detectUnsupportedCapabilities(
   ) {
     blockers.push({ code: 'sites_auth', path: hostingFile?.path ?? null });
   }
-  const workerFile = files.find(
-    ({ path }) => path.startsWith('worker/') || /(?:^|\/)worker\.[cm]?[jt]s$/u.test(path),
+  const unsafeShimFile = files.find(
+    (file) => classifySitesHostingShim(file.path, file.content) === 'unsafe_shim',
   );
+  const workerFile = files.find((file) => {
+    const workerPath =
+      file.path.startsWith('worker/') || /(?:^|\/)worker\.[cm]?[jt]s$/u.test(file.path);
+    return workerPath && classifySitesHostingShim(file.path, file.content) !== 'known_shim';
+  });
   const wranglerFile = files.find(({ path }) => /^wrangler\.(?:toml|jsonc?)$/u.test(path));
   const wranglerText = wranglerFile ? textOf(wranglerFile) : '';
   const wranglerDefinesWorkerRuntime =
-    /(?:^|[,{\n]\s*)["']?(?:main|d1_databases|r2_buckets|durable_objects|kv_namespaces|services|queues|vectorize|hyperdrive|analytics_engine_datasets|dispatch_namespaces|vars|ai|browser)["']?\s*[:=]/mu.test(
-      wranglerText,
-    );
+    wranglerFile !== undefined &&
+    !isMinimalHostingOnlyWranglerConfig(wranglerFile.path, wranglerText);
   if (
+    unsafeShimFile ||
     workerFile ||
     wranglerDefinesWorkerRuntime ||
     /cloudflare:workers|\bWorkerEntrypoint\b/u.test(allText)
   ) {
     blockers.push({
       code: 'worker_runtime',
-      path: workerFile?.path ?? wranglerFile?.path ?? null,
+      path: unsafeShimFile?.path ?? workerFile?.path ?? wranglerFile?.path ?? null,
     });
   }
   if (

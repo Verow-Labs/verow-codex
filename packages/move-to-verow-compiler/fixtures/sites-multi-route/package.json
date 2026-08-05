@@ -9,6 +9,14 @@
     "start": "wrangler pages dev",
     "preview": "vite preview",
     "deploy": "npm run preview",
+    "hidden:npm-exec": "npm exec vite -- build",
+    "hidden:pnpm-exec": "pnpm exec wrangler deploy",
+    "hidden:yarn": "yarn vinext build",
+    "hidden:bunx": "bunx vinext build",
+    "hidden:bun-chain": "bun run preview",
+    "hidden:bin-path": "./node_modules/.bin/wrangler deploy",
+    "hidden:node-package": "node ./node_modules/vite/bin/vite.js",
+    "hidden:cloudflare": "node ./node_modules/@opennextjs/cloudflare/dist/cli.js",
     "lint": "eslint ."
   },
   "dependencies": {
