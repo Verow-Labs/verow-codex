@@ -9,4 +9,14 @@ declare module 'semver' {
     range: string,
     options?: SemverSatisfiesOptions,
   ): boolean;
+
+  export function validRange(
+    range: string,
+    options?: Pick<SemverSatisfiesOptions, 'loose'>,
+  ): string | null;
+
+  export function valid(
+    version: string,
+    options?: Pick<SemverSatisfiesOptions, 'loose'>,
+  ): string | null;
 }

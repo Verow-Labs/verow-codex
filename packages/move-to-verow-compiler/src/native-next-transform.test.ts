@@ -22,6 +22,7 @@ import {
   type SitesSourceAnalysis,
   type WorkspaceReader,
 } from './admission.js';
+import { classifySitesHostingShim } from './hosting-shims.js';
 import { compareCodePointStrings } from './inventory.js';
 import { convertToNativeNext, writeOutputFiles } from './native-next-transform.js';
 
@@ -194,6 +195,34 @@ describe('native Next hosting-toolchain conversion', () => {
       start: 'next start',
       lint: 'eslint .',
     });
+  });
+
+  it.each([
+    ['Vinext', 'sh -c "vinext build"'],
+    ['Vite', 'sh -c "vite build"'],
+    ['Wrangler', "bash -lc 'wrangler deploy'"],
+    ['OpenNext Cloudflare binary', 'opennextjs-cloudflare build'],
+    ['next-on-pages binary', 'next-on-pages'],
+    ['quoted OpenNext .bin path', 'sh -c "./node_modules/.bin/opennextjs-cloudflare build"'],
+    ['quoted next-on-pages .bin path', 'sh -c "./node_modules/.bin/next-on-pages"'],
+    ['Cloudflare Vinext package', 'sh -c "npm exec @cloudflare/vinext"'],
+    ['Cloudflare Vite plugin package', 'sh -c "npm exec @cloudflare/vite-plugin"'],
+    ['Cloudflare Worker types package', 'sh -c "npm exec @cloudflare/workers-types"'],
+    ['OpenNext Cloudflare package', 'sh -c "npm exec @opennextjs/cloudflare"'],
+    ['next-on-pages package', 'sh -c "npm exec @cloudflare/next-on-pages"'],
+    ['Vite plugin package', 'sh -c "npm exec @vitejs/plugin-react"'],
+    ['Vite tsconfig paths package', 'sh -c "npm exec vite-tsconfig-paths"'],
+  ])('removes a script with a quoted or real %s invocation', async (_kind, command) => {
+    const sourceRoot = await fixtureCopy();
+    await mutateJsonFile(join(sourceRoot, 'package.json'), (packageJson) => {
+      const scripts = packageJson.scripts as Record<string, string>;
+      scripts['quoted-tool'] = command;
+    });
+    const analysis = await analyze(sourceRoot);
+    const { candidate } = await convertFixture({ sourceRoot, analysis });
+
+    expect((candidate.packageJson.scripts as Record<string, string>)['quoted-tool']).toBeUndefined();
+    expect((candidate.packageJson.scripts as Record<string, string>).lint).toBe('eslint .');
   });
 
   it('emits sorted output paths, stable preserved digests, and a content-free ordered receipt', async () => {
@@ -514,6 +543,115 @@ describe('native Next hosting-toolchain conversion', () => {
     ).rejects.toThrow(/hosting|vite|removed/iu);
   });
 
+  it('derives package identity from the registry URL instead of a spoofable lock name', async () => {
+    const sourceRoot = await fixtureCopy();
+    await mutateJsonFile(join(sourceRoot, 'package-lock.json'), (lock) => {
+      const packages = lock.packages as Record<string, Record<string, unknown>>;
+      const next = packages['node_modules/next'];
+      const vite = packages['node_modules/vite'];
+      if (next && vite) {
+        next.name = 'safe-package';
+        next.resolved = vite.resolved;
+      }
+    });
+    const analysis = await analyze(sourceRoot);
+
+    await expect(
+      convertToNativeNext({ analysis, sourceRoot, outputRoot: await emptyOutputRoot() }),
+    ).rejects.toThrow(/hosting|identity|registry|vite|name/iu);
+  });
+
+  it.each([
+    ['latest', 'next', 'latest'],
+    ['named tag', 'react', 'next-1'],
+  ])('accepts a frozen direct dependency selected by %s', async (_kind, name, tag) => {
+    const sourceRoot = await fixtureCopy();
+    for (const file of ['package.json', 'package-lock.json']) {
+      await mutateJsonFile(join(sourceRoot, file), (value) => {
+        const dependencies = (file === 'package.json'
+          ? value.dependencies
+          : (value.packages as Record<string, Record<string, unknown>>)['']?.dependencies) as Record<
+          string,
+          string
+        >;
+        dependencies[name] = tag;
+      });
+    }
+    const analysis = await analyze(sourceRoot);
+    const { candidate } = await convertFixture({ sourceRoot, analysis });
+
+    expect((candidate.packageJson.dependencies as Record<string, string>)[name]).toBe(tag);
+  });
+
+  it('accepts a frozen npm alias selected by a named dist-tag when all identities agree', async () => {
+    const sourceRoot = await fixtureCopy();
+    const specifier = 'npm:react@next-1';
+    await mutateJsonFile(join(sourceRoot, 'package.json'), (packageJson) => {
+      const dependencies = packageJson.dependencies as Record<string, string>;
+      dependencies['react-alias'] = specifier;
+    });
+    await mutateJsonFile(join(sourceRoot, 'package-lock.json'), (lock) => {
+      const packages = lock.packages as Record<string, Record<string, unknown>>;
+      const dependencies = packages['']?.dependencies as Record<string, string>;
+      dependencies['react-alias'] = specifier;
+      packages['node_modules/react-alias'] = {
+        ...packages['node_modules/react'],
+        name: 'react',
+      };
+    });
+    const analysis = await analyze(sourceRoot);
+    const { candidate } = await convertFixture({ sourceRoot, analysis });
+
+    expect(
+      (candidate.packageJson.dependencies as Record<string, string>)['react-alias'],
+    ).toBe(specifier);
+    expect(candidate.outputPaths).toContain('package-lock.json');
+  });
+
+  it('requires a concrete semantic version for a frozen dist-tag entry', async () => {
+    const sourceRoot = await fixtureCopy();
+    await mutateJsonFile(join(sourceRoot, 'package.json'), (packageJson) => {
+      const dependencies = packageJson.dependencies as Record<string, string>;
+      dependencies.next = 'latest';
+    });
+    await mutateJsonFile(join(sourceRoot, 'package-lock.json'), (lock) => {
+      const packages = lock.packages as Record<string, Record<string, unknown>>;
+      const dependencies = packages['']?.dependencies as Record<string, string>;
+      dependencies.next = 'latest';
+      if (packages['node_modules/next']) packages['node_modules/next'].version = 'not-a-version';
+    });
+    const analysis = await analyze(sourceRoot);
+
+    await expect(
+      convertToNativeNext({ analysis, sourceRoot, outputRoot: await emptyOutputRoot() }),
+    ).rejects.toThrow(/concrete|semantic|version/iu);
+  });
+
+  it.each([
+    ['empty selector', ''],
+    ['space-containing tag', 'not a tag'],
+    ['path-like tag', 'tag/name'],
+    ['encoded tag', 'tag%2fname'],
+    ['malformed alias tag', 'npm:react@tag+name'],
+  ])('rejects a malformed frozen registry selector: %s', async (_kind, specifier) => {
+    const sourceRoot = await fixtureCopy();
+    await mutateJsonFile(join(sourceRoot, 'package-lock.json'), (lock) => {
+      const packages = lock.packages as Record<string, Record<string, unknown>>;
+      const next = packages['node_modules/next'];
+      if (next) {
+        next.dependencies = {
+          ...(next.dependencies as Record<string, string>),
+          react: specifier,
+        };
+      }
+    });
+    const analysis = await analyze(sourceRoot);
+
+    await expect(
+      convertToNativeNext({ analysis, sourceRoot, outputRoot: await emptyOutputRoot() }),
+    ).rejects.toThrow(/specifier|selector|satisf|version|range/iu);
+  });
+
   it.each([
     ['absent', async (root: string) => rm(join(root, 'package-lock.json'))],
     [
@@ -579,6 +717,16 @@ describe('native Next hosting-toolchain conversion', () => {
 
   it('admits only the exact known Sites hosting shims and blocks semantic mutations', async () => {
     expect((await analyze()).admissible).toBe(true);
+    for (const path of ['worker/index.ts', 'build/sites-vite-plugin.ts']) {
+      const source = await readFile(join(fixtureRoot, path));
+      expect(classifySitesHostingShim(path, source)).toBe('known_shim');
+      expect(
+        classifySitesHostingShim(
+          path,
+          new TextEncoder().encode(`// equivalent trivia\n${new TextDecoder().decode(source).replaceAll('"', "'")}`),
+        ),
+      ).toBe('known_shim');
+    }
     const mutations: readonly [string, string, (source: string) => string][] = [
       ['custom route', 'worker/index.ts', (source) => `${source}\nexport const route = '/custom';\n`],
       [
@@ -600,7 +748,22 @@ describe('native Next hosting-toolchain conversion', () => {
       [
         'changed packaging behavior',
         'build/sites-vite-plugin.ts',
-        (source) => source.replace('.openai/hosting.json', '.env'),
+        (source) => source.replace('"hosting.json"', '".env"'),
+      ],
+      [
+        'changed image fetch behavior',
+        'worker/index.ts',
+        (source) => source.replace('fetchAsset', 'fetchImage'),
+      ],
+      [
+        'changed image response behavior',
+        'worker/index.ts',
+        (source) => source.replace('result.response()', 'result'),
+      ],
+      [
+        'removed resolved root behavior',
+        'build/sites-vite-plugin.ts',
+        (source) => source.replace('root = config.root;', ''),
       ],
     ];
 

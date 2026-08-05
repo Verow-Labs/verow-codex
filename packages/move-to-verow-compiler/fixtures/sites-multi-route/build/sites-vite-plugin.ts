@@ -1,19 +1,24 @@
-import { copyFile, mkdir, rm } from 'node:fs/promises';
-import { resolve } from 'node:path';
+import { cp, mkdir, rm } from "node:fs/promises";
+import { resolve } from "node:path";
+import type { Plugin } from "vite";
 
-import type { Plugin } from 'vite';
+// Packages Sites deployment metadata after Vite finishes compiling.
+export function sites(): Plugin {
+  let root = process.cwd();
 
-const hostingSource = resolve('.openai/hosting.json');
-const hostingDirectory = resolve('dist/.openai');
-const hostingDestination = resolve(hostingDirectory, 'hosting.json');
-
-export function sitesHostingMetadataPlugin(): Plugin {
   return {
-    name: 'sites-hosting-metadata',
+    name: "sites",
+    apply: "build",
+    configResolved(config) {
+      root = config.root;
+    },
     async closeBundle() {
-      await rm(hostingDirectory, { recursive: true, force: true });
-      await mkdir(hostingDirectory, { recursive: true });
-      await copyFile(hostingSource, hostingDestination);
+      const outputDirectory = resolve(root, "dist", ".openai");
+      const hostingConfig = resolve(root, ".openai", "hosting.json");
+
+      await rm(outputDirectory, { recursive: true, force: true });
+      await mkdir(outputDirectory, { recursive: true });
+      await cp(hostingConfig, resolve(outputDirectory, "hosting.json"));
     },
   };
 }

@@ -17,6 +17,9 @@
     "hidden:bin-path": "./node_modules/.bin/wrangler deploy",
     "hidden:node-package": "node ./node_modules/vite/bin/vite.js",
     "hidden:cloudflare": "node ./node_modules/@opennextjs/cloudflare/dist/cli.js",
+    "hidden:quoted-vite": "sh -c \"vite build\"",
+    "hidden:opennext-binary": "opennextjs-cloudflare build",
+    "hidden:next-on-pages-binary": "next-on-pages",
     "lint": "eslint ."
   },
   "dependencies": {

@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { constants } from 'node:fs';
 import { lstat, mkdir, open, readdir, realpath } from 'node:fs/promises';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
-import { satisfies } from 'semver';
+import { satisfies, valid, validRange } from 'semver';
 
 import type { SitesSourceAnalysis } from './admission.js';
 import {
@@ -77,6 +77,14 @@ const removedHostingPackages = new Set([
   'vinext',
   'vite',
   'vite-tsconfig-paths',
+  'wrangler',
+]);
+
+const removedHostingBinaries = new Set([
+  'next-on-pages',
+  'opennextjs-cloudflare',
+  'vinext',
+  'vite',
   'wrangler',
 ]);
 
@@ -303,10 +311,12 @@ function dependencyTargetsRemovedHostingPackage(name: string, specifier: unknown
 }
 
 function invokesRemovedTool(command: string, removedScriptNames: ReadonlySet<string>): boolean {
-  const tokens = command.match(/"[^"]*"|'[^']*'|[^\s;&|()]+/gu) ?? [];
+  const tokens = command.match(/[^\s;&|()'"`]+/gu) ?? [];
   for (const originalToken of tokens) {
-    const token = originalToken.replace(/^["']|["'],?$/gu, '').replaceAll('\\', '/');
-    if (isRemovedHostingPackage(token) || /^(?:vinext|vite|wrangler)$/u.test(token)) return true;
+    const token = originalToken.replace(/,+$/u, '').replaceAll('\\', '/');
+    if (isRemovedHostingPackage(token) || removedHostingBinaries.has(token)) return true;
+    const binaryName = token.split('/').at(-1) ?? '';
+    if (removedHostingBinaries.has(binaryName)) return true;
     if (token.startsWith('vite-plugin-') || token.startsWith('@vitejs/')) return true;
     const nodeModulesIndex = token.lastIndexOf('node_modules/');
     if (nodeModulesIndex >= 0) {
@@ -389,12 +399,6 @@ function rewritePackageJson(bytes: Uint8Array): {
   return { packageJson, bytes: canonicalJson(packageJson) };
 }
 
-function lockPackageName(path: string): string {
-  const leaf = path.split('/node_modules/').at(-1) ?? '';
-  const segments = leaf.split('/');
-  return leaf.startsWith('@') ? segments.slice(0, 2).join('/') : (segments[0] ?? '');
-}
-
 function parentLockPackagePath(path: string): string | null {
   const match = /(?:^|\/)node_modules\/(?:@[^/]+\/)?[^/]+$/u.exec(path);
   if (!match) return null;
@@ -446,19 +450,35 @@ function registryPackageIdentity(resolved: string): string | null {
     const marker = url.pathname.indexOf('/-/');
     if (marker < 0) return null;
     const encoded = url.pathname.slice(1, marker);
-    return decodeURIComponent(encoded).replace('%2f', '/');
+    if (url.pathname.slice(marker + 3) === '') return null;
+    const identity = decodeURIComponent(encoded);
+    if (
+      !(identity.startsWith('@')
+        ? /^@[^/\s]+\/[^/\s]+$/u.test(identity)
+        : /^[^/@\s]+$/u.test(identity))
+    ) {
+      return null;
+    }
+    return identity;
   } catch {
     return null;
   }
 }
 
 function lockedPackageIdentity(path: string, entry: Record<string, unknown>): string {
-  if (typeof entry.name === 'string' && entry.name !== '') return entry.name;
-  if (typeof entry.resolved === 'string') {
-    const registryIdentity = registryPackageIdentity(entry.resolved);
-    if (registryIdentity !== null) return registryIdentity;
+  if (typeof entry.resolved !== 'string') {
+    throw new Error(`reachable package-lock entry is not from the public npm registry: ${path}`);
   }
-  return lockPackageName(path);
+  const registryIdentity = registryPackageIdentity(entry.resolved);
+  if (registryIdentity === null) {
+    throw new Error(`reachable package-lock entry is not from the public npm registry: ${path}`);
+  }
+  if (entry.name !== undefined && entry.name !== registryIdentity) {
+    throw new Error(
+      `package-lock name disagrees with registry identity for ${path}: ${String(entry.name)}`,
+    );
+  }
+  return registryIdentity;
 }
 
 function specifierRange(specifier: string): { range: string; aliasTarget: string | null } {
@@ -469,12 +489,19 @@ function specifierRange(specifier: string): { range: string; aliasTarget: string
 }
 
 function versionSatisfiesSpecifier(version: string, specifier: string): boolean {
-  const { range } = specifierRange(specifier);
-  try {
-    return satisfies(version, range, { includePrerelease: false, loose: false });
-  } catch {
-    return false;
+  if (valid(version, { loose: false }) === null) {
+    throw new Error(`package-lock entry lacks a concrete semantic version: ${version}`);
   }
+  const { range } = specifierRange(specifier);
+  if (range === '' || range !== range.trim() || range === '.' || range === '..') {
+    throw new Error(`unsupported npm registry selector: ${specifier}`);
+  }
+  const semanticRange = validRange(range, { loose: false });
+  if (semanticRange !== null) {
+    return satisfies(version, semanticRange, { includePrerelease: false, loose: false });
+  }
+  if (encodeURIComponent(range) === range) return true;
+  throw new Error(`unsupported npm registry selector: ${specifier}`);
 }
 
 function assertSafeLockPackagePath(path: string): void {
@@ -517,10 +544,6 @@ function rewritePackageLock(
     const entry = packages[path];
     if (!isPlainObject(entry)) throw new Error(`package-lock entry is malformed: ${path}`);
     if (path !== '') {
-      const packageName = lockedPackageIdentity(path, entry);
-      if (isRemovedHostingPackage(packageName)) {
-        throw new Error(`removed hosting tool remains reachable in package-lock: ${packageName}`);
-      }
       if (
         typeof entry.version !== 'string' ||
         typeof entry.integrity !== 'string' ||
@@ -532,9 +555,13 @@ function rewritePackageLock(
       }
       if (
         typeof entry.resolved !== 'string' ||
-        !entry.resolved.startsWith('https://registry.npmjs.org/')
+        registryPackageIdentity(entry.resolved) === null
       ) {
         throw new Error(`reachable package-lock entry is not from the public npm registry: ${path}`);
+      }
+      const packageName = lockedPackageIdentity(path, entry);
+      if (isRemovedHostingPackage(packageName)) {
+        throw new Error(`removed hosting tool remains reachable in package-lock: ${packageName}`);
       }
     }
 
@@ -590,9 +617,10 @@ function rewritePackageLock(
       if (isRemovedHostingPackage(actualIdentity)) {
         throw new Error(`removed hosting tool remains reachable: ${actualIdentity}`);
       }
-      if (alias.aliasTarget !== null && actualIdentity !== alias.aliasTarget) {
+      const declaredIdentity = alias.aliasTarget ?? edge.name;
+      if (actualIdentity !== declaredIdentity) {
         throw new Error(
-          `package-lock alias ${edge.name} resolves ${actualIdentity} instead of ${alias.aliasTarget}`,
+          `package-lock dependency ${edge.name} resolves ${actualIdentity} instead of ${declaredIdentity}`,
         );
       }
       if (!reachable.has(dependencyPath)) {

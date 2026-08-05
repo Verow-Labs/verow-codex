@@ -3,54 +3,68 @@ import ts from 'typescript';
 export type SitesHostingShimClassification = 'known_shim' | 'unsafe_shim' | 'not_shim';
 
 const knownShimSources: Readonly<Record<string, string>> = {
-  'worker/index.ts': `import handler from 'vinext/server/app-router-entry';
-import {
-  DEFAULT_DEVICE_SIZES,
-  DEFAULT_IMAGE_SIZES,
-  handleImageOptimization,
-} from 'vinext/server/image-optimization';
+  'worker/index.ts': `import { handleImageOptimization, DEFAULT_DEVICE_SIZES, DEFAULT_IMAGE_SIZES } from "vinext/server/image-optimization";
+import handler from "vinext/server/app-router-entry";
 
 interface Env {
-  ASSETS: { fetch(request: Request): Promise<Response> };
+  ASSETS: {
+    fetch(request: Request): Promise<Response>;
+  };
   IMAGES: {
-    input(body: ReadableStream): {
-      transform(transforms: unknown): { output(options: unknown): Promise<Response> };
+    input(stream: ReadableStream): {
+      transform(options: Record<string, unknown>): {
+        output(options: { format: string; quality: number }): Promise<{ response(): Response }>;
+      };
     };
   };
 }
 
-export default {
-  async fetch(request: Request, env: Env, ctx: ExecutionContext) {
+interface ExecutionContext {
+  waitUntil(promise: Promise<unknown>): void;
+  passThroughOnException(): void;
+}
+
+const worker = {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
-    if (url.pathname === '/_vinext/image') {
+
+    if (url.pathname === "/_vinext/image") {
+      const allowedWidths = [...DEFAULT_DEVICE_SIZES, ...DEFAULT_IMAGE_SIZES];
       return handleImageOptimization(request, {
-        deviceSizes: DEFAULT_DEVICE_SIZES,
-        imageSizes: DEFAULT_IMAGE_SIZES,
-        fetcher: env.ASSETS.fetch.bind(env.ASSETS),
-        transformer: async (body, transforms, output) =>
-          env.IMAGES.input(body).transform(transforms).output(output),
-      });
+        fetchAsset: (path) => env.ASSETS.fetch(new Request(new URL(path, request.url))),
+        transformImage: async (body, { width, format, quality }) => {
+          const result = await env.IMAGES.input(body).transform(width > 0 ? { width } : {}).output({ format, quality });
+          return result.response();
+        },
+      }, allowedWidths);
     }
+
     return handler.fetch(request, env, ctx);
   },
 };
+
+export default worker;
 `,
-  'build/sites-vite-plugin.ts': `import { copyFile, mkdir, rm } from 'node:fs/promises';
-import { resolve } from 'node:path';
+  'build/sites-vite-plugin.ts': `import { cp, mkdir, rm } from "node:fs/promises";
+import { resolve } from "node:path";
+import type { Plugin } from "vite";
 
-import type { Plugin } from 'vite';
+export function sites(): Plugin {
+  let root = process.cwd();
 
-const hostingSource = resolve('.openai/hosting.json');
-const hostingDirectory = resolve('dist/.openai');
-const hostingDestination = resolve(hostingDirectory, 'hosting.json');
-
-export function sitesHostingMetadataPlugin(): Plugin {
   return {
-    name: 'sites-hosting-metadata',
+    name: "sites",
+    apply: "build",
+    configResolved(config) {
+      root = config.root;
+    },
     async closeBundle() {
-      await rm(hostingDirectory, { recursive: true, force: true });
-      await mkdir(hostingDirectory, { recursive: true });
-      await copyFile(hostingSource, hostingDestination);
+      const outputDirectory = resolve(root, "dist", ".openai");
+      const hostingConfig = resolve(root, ".openai", "hosting.json");
+
+      await rm(outputDirectory, { recursive: true, force: true });
+      await mkdir(outputDirectory, { recursive: true });
+      await cp(hostingConfig, resolve(outputDirectory, "hosting.json"));
     },
   };
 }
@@ -66,7 +80,10 @@ function tokenFingerprint(source: string): string {
   );
   const tokens: string[] = [];
   for (let token = scanner.scan(); token !== ts.SyntaxKind.EndOfFileToken; token = scanner.scan()) {
-    tokens.push(`${token}:${scanner.getTokenText()}`);
+    const tokenText = token === ts.SyntaxKind.StringLiteral
+      ? scanner.getTokenValue()
+      : scanner.getTokenText();
+    tokens.push(`${token}:${tokenText}`);
   }
   return tokens.join('\0');
 }
