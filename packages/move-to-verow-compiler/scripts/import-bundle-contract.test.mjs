@@ -121,6 +121,31 @@ test('includes npm-shrinkwrap.json in the actual package contents', async () => 
   );
 });
 
+test('rejects a lock entry version that does not satisfy its declaring specifier', async () => {
+  const shrinkwrap = JSON.parse(await readFile(join(packageRoot, 'npm-shrinkwrap.json'), 'utf8'));
+  shrinkwrap.packages['node_modules/ajv'].version = '0.0.1';
+
+  assert.throws(
+    () => reachableRuntimePackages(shrinkwrap.packages),
+    /ajv.*0\.0\.1.*8\.20\.0/u,
+  );
+});
+
+test('rejects an unresolved required peer while allowing optional peers to be absent', async () => {
+  const shrinkwrap = JSON.parse(await readFile(join(packageRoot, 'npm-shrinkwrap.json'), 'utf8'));
+  delete shrinkwrap.packages['node_modules/playwright-core'];
+
+  assert.throws(
+    () => reachableRuntimePackages(shrinkwrap.packages),
+    /@axe-core\/playwright.*playwright-core.*required peer/u,
+  );
+
+  shrinkwrap.packages['node_modules/@axe-core/playwright'].peerDependenciesMeta = {
+    'playwright-core': { optional: true },
+  };
+  assert.doesNotThrow(() => reachableRuntimePackages(shrinkwrap.packages));
+});
+
 function reachableRuntimePackages(packages) {
   const reachable = new Set();
   const pending = [''];
@@ -129,21 +154,119 @@ function reachableRuntimePackages(packages) {
     if (path === undefined || reachable.has(path)) continue;
     const entry = packages[path];
     assert.ok(entry, `missing shrinkwrap entry ${path || '<root>'}`);
+    assert.ok(
+      parseConcreteVersion(entry.version),
+      `${path || '<root>'} must have a concrete semantic version`,
+    );
     reachable.add(path);
-    for (const [name] of Object.entries({
+    for (const [name, specifier] of Object.entries({
       ...entry.dependencies,
       ...entry.optionalDependencies,
     })) {
       const resolved = resolveLockedDependency(packages, path, name);
       assert.ok(resolved, `${path || '<root>'} dependency ${name} must be frozen`);
+      assertLockedVersion(packages[resolved], specifier, resolved);
       pending.push(resolved);
     }
-    for (const name of Object.keys(entry.peerDependencies ?? {})) {
+    for (const [name, specifier] of Object.entries(entry.peerDependencies ?? {})) {
       const resolved = resolveLockedDependency(packages, path, name);
-      if (resolved) pending.push(resolved);
+      const optional = entry.peerDependenciesMeta?.[name]?.optional === true;
+      if (!resolved) {
+        assert.ok(optional, `${path || '<root>'} ${name} required peer must be frozen`);
+        continue;
+      }
+      assertLockedVersion(packages[resolved], specifier, resolved);
+      pending.push(resolved);
     }
   }
   return reachable;
+}
+
+function assertLockedVersion(entry, specifier, path) {
+  assert.ok(entry, `missing shrinkwrap entry ${path}`);
+  assert.ok(
+    satisfiesSpecifier(entry.version, specifier),
+    `${path} ${entry.version} does not satisfy ${specifier}`,
+  );
+}
+
+function satisfiesSpecifier(version, specifier) {
+  const concrete = parseConcreteVersion(version);
+  if (!concrete || typeof specifier !== 'string') return false;
+  const alternatives = specifier.split('||').map((value) => value.trim());
+  return alternatives.some((range) => {
+    if (range === '*') return true;
+    if (range.startsWith('^')) return satisfiesCaret(concrete, range.slice(1));
+    if (range.startsWith('~')) return satisfiesTilde(concrete, range.slice(1));
+    if (range.startsWith('>=')) {
+      const minimum = parseConcreteVersion(range.slice(2).trim());
+      return minimum !== null && compareVersions(concrete, minimum) >= 0;
+    }
+    const exact = parseConcreteVersion(range);
+    return exact !== null && compareVersions(concrete, exact) === 0;
+  });
+}
+
+function satisfiesCaret(version, minimumText) {
+  const minimum = parseConcreteVersion(minimumText);
+  if (!minimum || compareVersions(version, minimum) < 0) return false;
+  const maximum =
+    minimum.major > 0
+      ? { major: minimum.major + 1, minor: 0, patch: 0, prerelease: [] }
+      : minimum.minor > 0
+        ? { major: 0, minor: minimum.minor + 1, patch: 0, prerelease: [] }
+        : { major: 0, minor: 0, patch: minimum.patch + 1, prerelease: [] };
+  return compareVersions(version, maximum) < 0;
+}
+
+function satisfiesTilde(version, minimumText) {
+  const minimum = parseConcreteVersion(minimumText);
+  if (!minimum || compareVersions(version, minimum) < 0) return false;
+  const maximum = {
+    major: minimum.major,
+    minor: minimum.minor + 1,
+    patch: 0,
+    prerelease: [],
+  };
+  return compareVersions(version, maximum) < 0;
+}
+
+function parseConcreteVersion(value) {
+  if (typeof value !== 'string') return null;
+  const match = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/u.exec(
+    value,
+  );
+  if (!match) return null;
+  return {
+    major: Number(match[1]),
+    minor: Number(match[2]),
+    patch: Number(match[3]),
+    prerelease: match[4]?.split('.') ?? [],
+  };
+}
+
+function compareVersions(left, right) {
+  for (const key of ['major', 'minor', 'patch']) {
+    if (left[key] !== right[key]) return left[key] - right[key];
+  }
+  if (left.prerelease.length === 0 || right.prerelease.length === 0) {
+    return right.prerelease.length - left.prerelease.length;
+  }
+  const length = Math.max(left.prerelease.length, right.prerelease.length);
+  for (let index = 0; index < length; index += 1) {
+    const leftPart = left.prerelease[index];
+    const rightPart = right.prerelease[index];
+    if (leftPart === undefined) return -1;
+    if (rightPart === undefined) return 1;
+    if (leftPart === rightPart) continue;
+    const leftNumber = /^\d+$/u.test(leftPart) ? Number(leftPart) : null;
+    const rightNumber = /^\d+$/u.test(rightPart) ? Number(rightPart) : null;
+    if (leftNumber !== null && rightNumber !== null) return leftNumber - rightNumber;
+    if (leftNumber !== null) return -1;
+    if (rightNumber !== null) return 1;
+    return leftPart < rightPart ? -1 : 1;
+  }
+  return 0;
 }
 
 function resolveLockedDependency(packages, parentPath, name) {
