@@ -1,0 +1,4 @@
+{
+  "framework": "vinext",
+  "buildCommand": "npm run build"
+}

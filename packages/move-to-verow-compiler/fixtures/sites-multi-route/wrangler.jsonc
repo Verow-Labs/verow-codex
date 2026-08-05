@@ -1,0 +1,5 @@
+{
+  // Hosting metadata only: no Worker entrypoint, bindings, or durable state.
+  "name": "trusted-sites-multi-route-fixture",
+  "compatibility_date": "2026-08-05"
+}

@@ -256,13 +256,23 @@ function detectUnsupportedCapabilities(
     blockers.push({ code: 'sites_auth', path: hostingFile?.path ?? null });
   }
   const workerFile = files.find(
-    ({ path }) =>
-      path.startsWith('worker/') ||
-      /^wrangler\.(?:toml|jsonc?)$/u.test(path) ||
-      /(?:^|\/)worker\.[cm]?[jt]s$/u.test(path),
+    ({ path }) => path.startsWith('worker/') || /(?:^|\/)worker\.[cm]?[jt]s$/u.test(path),
   );
-  if (workerFile || /cloudflare:workers|\bWorkerEntrypoint\b/u.test(allText)) {
-    blockers.push({ code: 'worker_runtime', path: workerFile?.path ?? null });
+  const wranglerFile = files.find(({ path }) => /^wrangler\.(?:toml|jsonc?)$/u.test(path));
+  const wranglerText = wranglerFile ? textOf(wranglerFile) : '';
+  const wranglerDefinesWorkerRuntime =
+    /(?:^|[,{\n]\s*)["']?(?:main|d1_databases|r2_buckets|durable_objects|kv_namespaces|services|queues|vectorize|hyperdrive|analytics_engine_datasets|dispatch_namespaces|vars|ai|browser)["']?\s*[:=]/mu.test(
+      wranglerText,
+    );
+  if (
+    workerFile ||
+    wranglerDefinesWorkerRuntime ||
+    /cloudflare:workers|\bWorkerEntrypoint\b/u.test(allText)
+  ) {
+    blockers.push({
+      code: 'worker_runtime',
+      path: workerFile?.path ?? wranglerFile?.path ?? null,
+    });
   }
   if (
     (hosting && hasConfiguredValue(hosting.durableObjects)) ||

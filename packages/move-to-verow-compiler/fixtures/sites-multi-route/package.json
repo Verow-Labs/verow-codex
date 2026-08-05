@@ -1,0 +1,36 @@
+{
+  "name": "trusted-sites-multi-route-fixture",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Content-free compiler fixture",
+  "scripts": {
+    "dev": "vinext dev",
+    "build": "vinext build",
+    "start": "wrangler pages dev",
+    "preview": "vite preview",
+    "deploy": "npm run preview",
+    "lint": "eslint ."
+  },
+  "dependencies": {
+    "next": "16.2.6",
+    "react": "19.2.3",
+    "react-dom": "19.2.3",
+    "vinext": "0.0.11"
+  },
+  "devDependencies": {
+    "@cloudflare/vite-plugin": "1.21.0",
+    "@types/node": "25.0.10",
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "@vitejs/plugin-react": "5.0.4",
+    "typescript": "5.9.3",
+    "vite": "7.3.1",
+    "wrangler": "4.61.1"
+  },
+  "optionalDependencies": {
+    "vite-plugin-inspect": "11.3.3"
+  },
+  "fixtureMetadata": {
+    "preserve": true
+  }
+}

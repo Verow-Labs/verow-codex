@@ -16,3 +16,9 @@ export {
   type CanonicalDigestVector,
   type ContractValidationResult,
 } from './bundle-contract.js';
+export {
+  convertToNativeNext,
+  type ConvertToNativeNextInput,
+  type NativeNextCandidate,
+  type NativeNextMutation,
+} from './native-next-transform.js';
