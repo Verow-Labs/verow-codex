@@ -1,0 +1,83 @@
+{
+  "$ref": "#/definitions/MigrationBundleManifestV1",
+  "definitions": {
+    "MigrationBundleManifestV1": {
+      "type": "object",
+      "properties": {
+        "version": {
+          "type": "string",
+          "const": "move-to-verow.bundle.v1"
+        },
+        "migrationId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "websiteId": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sourceDigest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "artifactDigest": {
+          "$ref": "#/definitions/MigrationBundleManifestV1/properties/sourceDigest"
+        },
+        "archiveFormat": {
+          "type": "string",
+          "const": "tar_gzip_v1"
+        },
+        "sourceKind": {
+          "type": "string",
+          "const": "codex_sites_local"
+        },
+        "framework": {
+          "type": "string",
+          "const": "nextjs_app_router"
+        },
+        "fileCount": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "minimum": -9007199254740991,
+          "maximum": 9007199254740991
+        },
+        "totalBytes": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "minimum": -9007199254740991,
+          "maximum": 9007199254740991
+        },
+        "capabilityClaims": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "privateManifestDigest": {
+          "$ref": "#/definitions/MigrationBundleManifestV1/properties/sourceDigest"
+        },
+        "evidenceDigest": {
+          "$ref": "#/definitions/MigrationBundleManifestV1/properties/sourceDigest"
+        }
+      },
+      "required": [
+        "version",
+        "migrationId",
+        "websiteId",
+        "sourceDigest",
+        "artifactDigest",
+        "archiveFormat",
+        "sourceKind",
+        "framework",
+        "fileCount",
+        "totalBytes",
+        "capabilityClaims",
+        "privateManifestDigest",
+        "evidenceDigest"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "$schema": "http://json-schema.org/draft-07/schema#"
+}

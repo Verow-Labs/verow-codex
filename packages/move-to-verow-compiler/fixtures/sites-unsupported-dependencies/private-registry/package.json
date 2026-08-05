@@ -1,0 +1,1 @@
+{"name":"private-registry","dependencies":{"private-package":"https://registry.example.invalid/private-package.tgz"}}

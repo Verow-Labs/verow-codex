@@ -1,0 +1,10 @@
+{
+  "sourceCommit": "6f3061cf61b90acf3447a57c84792c3a8bfcb96f",
+  "sha256": "sha256:35801419921e72879bbf298b45bfacea56daca1b3f890b69188616fe85728735",
+  "canonicalVectorsSha256": "sha256:fc37985b961bb76a557539dcd0ab3b40b457c9747f878dcd69fe296cdd1cbf1d",
+  "files": {
+    "migration-bundle.schema.json": "sha256:35801419921e72879bbf298b45bfacea56daca1b3f890b69188616fe85728735",
+    "migration-bundle.schema.sha256": "sha256:be3730e8e7d72196e4a887fde6217baab2c2623f75cf0028182b87edb1a279f6",
+    "canonical-digest-vectors.json": "sha256:fc37985b961bb76a557539dcd0ab3b40b457c9747f878dcd69fe296cdd1cbf1d"
+  }
+}

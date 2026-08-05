@@ -1,0 +1,1 @@
+{"name":"git-dependency","dependencies":{"git-package":"git+https://example.invalid/package.git"}}

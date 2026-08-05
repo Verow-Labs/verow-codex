@@ -1,0 +1,46 @@
+[
+  {
+    "id": "object-key-order",
+    "value": {
+      "z": null,
+      "a": [true, 12, "é"]
+    },
+    "digest": "sha256:3d717d2fe396ba5960c7d70092408e7b0408df1ee42f2e584b890924dc9ae998"
+  },
+  {
+    "id": "nested-empty-values",
+    "value": {
+      "object": {},
+      "array": [],
+      "string": ""
+    },
+    "digest": "sha256:160df1cb7c08864a4d113733fe02cfbc06a3e39c4ce0e0273ca7f2bb42e0facc"
+  },
+  {
+    "id": "nested-object-key-order",
+    "value": {
+      "outer": {
+        "z": 2,
+        "a": {
+          "y": false,
+          "b": true
+        }
+      },
+      "list": [
+        {
+          "b": 1,
+          "a": 0
+        }
+      ]
+    },
+    "digest": "sha256:b3e504169ce66de200e677e921a196d4765fdf31f86f3f353f204205a72e7a2b"
+  },
+  {
+    "id": "unicode-utf16-key-order",
+    "value": {
+      "": "bmp",
+      "𐀀": "astral"
+    },
+    "digest": "sha256:5e72745dd500f8b8d997ef851679707b89099da29d2aca4b93dfd85810ebaa20"
+  }
+]

@@ -1,0 +1,8 @@
+{
+  "name": "synthetic-sites-minimal",
+  "private": true,
+  "dependencies": {
+    "next": "16.0.0",
+    "react": "19.2.0"
+  }
+}
