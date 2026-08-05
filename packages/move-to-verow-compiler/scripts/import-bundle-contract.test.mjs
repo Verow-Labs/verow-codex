@@ -146,6 +146,46 @@ test('rejects an unresolved required peer while allowing optional peers to be ab
   assert.doesNotThrow(() => reachableRuntimePackages(shrinkwrap.packages));
 });
 
+test('rejects a reachable prerelease that only satisfies ordinary b4a ranges numerically', async () => {
+  const shrinkwrap = JSON.parse(await readFile(join(packageRoot, 'npm-shrinkwrap.json'), 'utf8'));
+  shrinkwrap.packages['node_modules/b4a'].version = '1.9.0-beta';
+
+  assert.throws(
+    () => reachableRuntimePackages(shrinkwrap.packages),
+    /b4a.*1\.9\.0-beta.*\^1\.(?:8\.1|6\.4)/u,
+  );
+});
+
+test('accepts prereleases when the active comparator set names the same release tuple', () => {
+  for (const [version, specifier] of [
+    ['1.9.0-beta.2', '^1.9.0-beta.1'],
+    ['1.9.0', '^1.9.0-beta.1'],
+    ['1.9.0-beta.2', '~1.9.0-beta.1'],
+    ['1.9.0-beta.2', '>=1.9.0-beta.1'],
+    ['1.9.0-beta.2', '1.9.0-beta.2'],
+    ['2.0.0-beta.2', '^1.0.0 || >=2.0.0-beta.1'],
+  ]) {
+    assert.equal(satisfiesSpecifier(version, specifier), true, `${version} must satisfy ${specifier}`);
+  }
+});
+
+test('excludes prereleases from comparator sets without the same prerelease tuple', () => {
+  for (const [version, specifier] of [
+    ['1.9.0-beta', '^1.8.1'],
+    ['1.8.2-beta', '~1.8.1'],
+    ['1.9.0-beta', '>=1.8.1'],
+    ['1.9.0-beta', '*'],
+    ['1.10.0-beta', '^1.9.0-beta.1'],
+    ['1.9.0-beta', '^1.8.1 || >=1.8.0'],
+  ]) {
+    assert.equal(
+      satisfiesSpecifier(version, specifier),
+      false,
+      `${version} must not satisfy ${specifier}`,
+    );
+  }
+});
+
 function reachableRuntimePackages(packages) {
   const reachable = new Set();
   const pending = [''];
@@ -195,6 +235,7 @@ function satisfiesSpecifier(version, specifier) {
   if (!concrete || typeof specifier !== 'string') return false;
   const alternatives = specifier.split('||').map((value) => value.trim());
   return alternatives.some((range) => {
+    if (!comparatorSetAllowsPrerelease(concrete, range)) return false;
     if (range === '*') return true;
     if (range.startsWith('^')) return satisfiesCaret(concrete, range.slice(1));
     if (range.startsWith('~')) return satisfiesTilde(concrete, range.slice(1));
@@ -205,6 +246,23 @@ function satisfiesSpecifier(version, specifier) {
     const exact = parseConcreteVersion(range);
     return exact !== null && compareVersions(concrete, exact) === 0;
   });
+}
+
+function comparatorSetAllowsPrerelease(version, range) {
+  if (version.prerelease.length === 0) return true;
+  const comparatorText = range.startsWith('^') || range.startsWith('~')
+    ? range.slice(1)
+    : range.startsWith('>=')
+      ? range.slice(2).trim()
+      : range;
+  const comparator = parseConcreteVersion(comparatorText);
+  return (
+    comparator !== null &&
+    comparator.prerelease.length > 0 &&
+    comparator.major === version.major &&
+    comparator.minor === version.minor &&
+    comparator.patch === version.patch
+  );
 }
 
 function satisfiesCaret(version, minimumText) {
