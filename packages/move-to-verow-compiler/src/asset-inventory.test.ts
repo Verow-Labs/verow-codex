@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { brotliCompressSync } from 'node:zlib';
 
 import { describe, expect, it } from 'vitest';
 
@@ -109,6 +110,23 @@ describe('migration asset inventory', () => {
     }
   });
 
+  it('rejects IANA special-use IPv6 evidence while accepting clearly global unicast addresses', async () => {
+    const captured = local({ authority: 'hosted_source_capture' } as never);
+    const specialUse = [
+      '::', '::1', '::ffff:10.0.0.1', '64:ff9b::808:808', '64:ff9b:1::1', '100::1', '100:0:0:1::1',
+      '2001::1', '2001:1::1', '2001:2::1', '2001:3::1', '2001:4:112::1', '2001:10::1', '2001:20::1',
+      '2001:30::1', '2001:db8::1', '2002::1', '2620:4f:8000::1', '3fff::1', '5f00::1', 'fc00::1', 'fe80::1', 'ff02::1',
+    ];
+    for (const address of specialUse) {
+      const result = await inventoryMigrationAssets({ assets: [{ ...captured, captureReceipt: captureReceipt({ resolvedAddresses: [{ host: 'assets.example.test', address, public: true }] }) } as AssetInput] });
+      expect(result.blockers, address).toContainEqual({ code: 'capture_receipt_invalid' });
+    }
+    for (const address of ['2001:4860:4860::8888', '2606:4700:4700::1111']) {
+      const result = await inventoryMigrationAssets({ assets: [{ ...captured, captureReceipt: captureReceipt({ resolvedAddresses: [{ host: 'assets.example.test', address, public: true }] }) } as AssetInput] });
+      expect(result.status, address).toBe('ready');
+    }
+  });
+
   it('blocks unsafe URLs, digest drift, malformed image data, and non-tightening limits with content-free blockers', async () => {
     const badUrls = ['http://example.test/a.png', 'https://user:pass@example.test/a.png', 'https://localhost/a.png', 'https://127.0.0.1/a.png', 'https://10.0.0.1/a.png', 'https://203.0.113.10/a.png', 'https://[::1]/a.png', 'https://[2001:db8::1]/a.png'];
     for (const externalUrl of badUrls) {
@@ -142,6 +160,46 @@ describe('migration asset inventory', () => {
     expect(frames.blockers.map(({ code }) => code)).toContain('asset_policy_blocked');
   });
 
+  it('short-circuits cardinality and byte preflight limits before hashing or decoder work', async () => {
+    class ObservedBytes extends Uint8Array {
+      reads = 0;
+      override get byteLength(): number { this.reads += 1; return super.byteLength; }
+    }
+    const observed = (source: Uint8Array): { bytes: ObservedBytes; digest: `sha256:${string}` } => {
+      const bytes = new ObservedBytes(source);
+      const digest = sha256(bytes);
+      bytes.reads = 0;
+      return { bytes, digest };
+    };
+    const first = observed(png);
+    const second = observed(png2x2);
+    const assets = [
+      local({ bytes: first.bytes, digest: first.digest }),
+      local({ bytes: second.bytes, digest: second.digest, reference: { id: 'second', sourcePath: 'public/second.png', target: { key: 'page.second.image', locale: 'en', variant: null } } }),
+    ];
+
+    const cardinality = await inventoryMigrationAssets({ assets, limits: { maxAssets: 1 } });
+    expect(cardinality.blockers).toEqual([{ code: 'asset_policy_blocked' }]);
+    expect([first.bytes.reads, second.bytes.reads]).toEqual([0, 0]);
+
+    first.bytes.reads = 0;
+    second.bytes.reads = 0;
+    const references = await inventoryMigrationAssets({ assets, limits: { maxAssets: 2, maxReferences: 1 } });
+    expect(references.blockers).toEqual([{ code: 'asset_policy_blocked' }]);
+    expect([first.bytes.reads, second.bytes.reads]).toEqual([0, 0]);
+
+    first.bytes.reads = 0;
+    second.bytes.reads = 0;
+    const aggregate = await inventoryMigrationAssets({ assets, limits: { maxTotalBytes: png.byteLength + 1 } });
+    expect(aggregate.blockers).toEqual([{ code: 'asset_policy_blocked' }]);
+    expect(second.bytes.reads).toBe(1);
+
+    second.bytes.reads = 0;
+    const single = await inventoryMigrationAssets({ assets: [assets[1] as AssetInput], limits: { maxSingleBytes: png.byteLength } });
+    expect(single.blockers).toEqual([{ code: 'asset_policy_blocked' }]);
+    expect(second.bytes.reads).toBe(1);
+  });
+
   it('accepts licensed structural WOFF evidence but blocks arbitrary structural binary and missing font licensing', async () => {
     const woff = Buffer.alloc(68);
     woff.write('wOFF', 0, 'ascii');
@@ -161,12 +219,67 @@ describe('migration asset inventory', () => {
     const ready = await inventoryMigrationAssets({ assets: [font] });
     expect(ready).toMatchObject({ status: 'ready', bundled: [], structural: [{ mime: 'font/woff' }] });
 
+    const woff2Body = brotliCompressSync(Buffer.alloc(4));
+    const woff2 = Buffer.alloc(50 + woff2Body.byteLength);
+    woff2.write('wOF2', 0, 'ascii');
+    woff2.writeUInt32BE(0x0001_0000, 4);
+    woff2.writeUInt32BE(woff2.byteLength, 8);
+    woff2.writeUInt16BE(1, 12);
+    woff2.writeUInt32BE(32, 16);
+    woff2.writeUInt32BE(woff2Body.byteLength, 20);
+    woff2[48] = 5;
+    woff2[49] = 4;
+    woff2Body.copy(woff2, 50);
+    const woff2Font = local({
+      classification: 'structural_git', bytes: woff2, digest: sha256(woff2), reference: { id: 'brand-font-2', sourcePath: 'fonts/brand.woff2' },
+      structuralKind: 'font', fontLicense: { spdxId: 'OFL-1.1', notice: 'Synthetic fixture font' },
+    } as never);
+    const woff2Ready = await inventoryMigrationAssets({ assets: [woff2Font] });
+    expect(woff2Ready).toMatchObject({ status: 'ready', bundled: [], structural: [{ mime: 'font/woff2' }] });
+
     for (const candidate of [
       { ...font, fontLicense: undefined },
       local({ classification: 'structural_git', bytes: Buffer.from('arbitrary binary'), digest: sha256(Buffer.from('arbitrary binary')), reference: { id: 'binary', sourcePath: 'public/data.bin' } }),
     ]) {
       const result = await inventoryMigrationAssets({ assets: [candidate as AssetInput] });
       expect(result.blockers.map(({ code }) => code)).toContain('asset_policy_blocked');
+    }
+  });
+
+  it('rejects header-only WOFF2 and malformed WOFF container directories with content-free blockers', async () => {
+    const asFont = (bytes: Uint8Array, id: string): AssetInput => local({
+      classification: 'structural_git', bytes, digest: sha256(bytes),
+      reference: { id, sourcePath: `fonts/${id}` }, structuralKind: 'font',
+      fontLicense: { spdxId: 'OFL-1.1', notice: 'Synthetic fixture font' },
+    } as never);
+    const fakeWoff2 = Buffer.alloc(48);
+    fakeWoff2.write('wOF2', 0, 'ascii');
+    fakeWoff2.writeUInt32BE(fakeWoff2.byteLength, 8);
+    fakeWoff2.writeUInt16BE(1, 12);
+
+    const validWoff = Buffer.alloc(68);
+    validWoff.write('wOFF', 0, 'ascii');
+    validWoff.writeUInt32BE(0x0001_0000, 4);
+    validWoff.writeUInt32BE(validWoff.byteLength, 8);
+    validWoff.writeUInt16BE(1, 12);
+    validWoff.writeUInt32BE(32, 16);
+    validWoff.write('name', 44, 'ascii');
+    validWoff.writeUInt32BE(64, 48);
+    validWoff.writeUInt32BE(4, 52);
+    validWoff.writeUInt32BE(4, 56);
+    const malformed = [
+      fakeWoff2,
+      (() => { const bytes = Buffer.from(validWoff); bytes.writeUInt32BE(0, 16); return bytes; })(),
+      (() => { const bytes = Buffer.from(validWoff); bytes.writeUInt32BE(60, 48); return bytes; })(),
+      (() => { const bytes = Buffer.concat([validWoff, Buffer.alloc(4)]); bytes.writeUInt32BE(bytes.byteLength, 8); return bytes; })(),
+      (() => { const bytes = Buffer.from(validWoff); bytes.writeUInt32BE(64, 24); return bytes; })(),
+      (() => { const bytes = Buffer.from(validWoff); bytes.writeUInt32BE(64, 36); bytes.writeUInt32BE(8, 40); return bytes; })(),
+    ];
+
+    for (const [index, bytes] of malformed.entries()) {
+      const result = await inventoryMigrationAssets({ assets: [asFont(bytes, `malformed-${index}.woff`)] });
+      expect(result.blockers).toEqual([{ code: 'asset_policy_blocked' }]);
+      expect(JSON.stringify(result)).not.toContain('Synthetic fixture font');
     }
   });
 

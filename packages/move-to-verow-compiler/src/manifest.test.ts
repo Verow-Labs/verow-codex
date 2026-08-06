@@ -388,6 +388,16 @@ describe('migration artifact compiler', () => {
       policy: imageInput.policy,
     });
     expect(() => compileMigrationArtifacts(privateExternal)).toThrow('manifest_input_invalid');
+
+    const specialUrl = 'https://[2001:2::1]/secret.png';
+    expect(() => compileMigrationArtifacts({
+      ...privateExternal,
+      extraction: { ...privateExternal.extraction, values: { [`${image.key}\u0000en\u0000`]: value(image.key, specialUrl) } },
+      assets: {
+        ...privateExternal.assets,
+        external: [{ ...privateExternal.assets.external[0]!, url: specialUrl, provenance: { authority: 'declared_external', url: specialUrl, privateBoundary: 'synthetic-boundary' } }],
+      },
+    })).toThrow('manifest_input_invalid');
   });
 
   it('rejects unknown target enums and malformed declaration semantics', () => {
@@ -417,5 +427,48 @@ describe('migration artifact compiler', () => {
         collectionPolicy: [{ key: root.key, locale: 'en', variant: null, minimumItems: 0, maximumItems: 1_001, requiredItemIds: [] }],
       },
     }))).toThrow('manifest_collection_invalid');
+  });
+
+  it('fails oversized route, declaration, and asset arrays before inspecting hostile elements', () => {
+    const secret = 'sk_synthetic_oversized_secret';
+    const hostile = new Proxy({}, { get() { throw new Error(secret); } });
+    const cases: Array<{ expected: string; value: CompileMigrationArtifactsInput }> = [
+      { expected: 'manifest_route_limit_exceeded', value: input({ routes: Array.from({ length: 501 }, () => hostile) as never }) },
+      { expected: 'manifest_declaration_limit_exceeded', value: input({ extraction: { ...input().extraction, thirdPartyBoundaries: Array.from({ length: 101 }, () => hostile) as never } }) },
+      { expected: 'manifest_declaration_limit_exceeded', value: input({ extraction: { ...input().extraction, derived: Array.from({ length: 501 }, () => hostile) as never } }) },
+      { expected: 'manifest_declaration_limit_exceeded', value: input({ extraction: { ...input().extraction, structural: Array.from({ length: 501 }, () => hostile) as never } }) },
+      { expected: 'manifest_asset_limit_exceeded', value: input({ assets: { ...input().assets, bundled: Array.from({ length: 501 }, () => hostile) as never } }) },
+    ];
+    for (const { expected, value: compileInput } of cases) {
+      try {
+        compileMigrationArtifacts(compileInput);
+        throw new Error('expected bound rejection');
+      } catch (error) {
+        expect(String(error)).toBe(`Error: ${expected}`);
+        expect(String(error)).not.toContain(secret);
+      }
+    }
+  });
+
+  it('rejects forged ready-inventory zero, negative, inconsistent, and over-limit numeric metadata', () => {
+    const image = target('page.home.hero.image', 'image');
+    const imageIdentity = { key: image.key, locale: 'en', variant: null } as const;
+    const compileWithAsset = (overrides: Record<string, unknown>, bytes = imageBytes): CompileMigrationArtifactsInput => {
+      const digest = sha256(bytes);
+      return input({
+        extraction: { ...input().extraction, targets: [image], values: { [`${image.key}\u0000en\u0000`]: value(image.key, digest) } },
+        assets: {
+          status: 'ready', external: [], structural: [], blockers: [],
+          bundled: [{ digest, bytes: bytes.byteLength, bytesValue: bytes, mime: 'image/png', encodedWidth: 1, encodedHeight: 1, renderedWidth: 1, renderedHeight: 1, pageCount: 1, animated: false, references: [{ id: 'hero', sourcePath: 'public/hero.png', target: imageIdentity, classification: 'editorial_cms', provenance: { authority: 'source_local', sourcePath: 'public/hero.png' } }], ...overrides } as never],
+        },
+        policy: { targets: [policyTarget(image.key)], collectionPolicy: [] },
+      });
+    };
+    for (const overrides of [
+      { encodedWidth: -1 }, { encodedWidth: 0 }, { encodedHeight: 0 }, { renderedWidth: 0 }, { renderedHeight: 0 },
+      { pageCount: -1 }, { pageCount: 0 }, { pageCount: 1, animated: true }, { pageCount: 2, animated: false },
+      { encodedWidth: 16_385 }, { pageCount: 257 }, { renderedWidth: 10_000, renderedHeight: 10_000 },
+    ]) expect(() => compileMigrationArtifacts(compileWithAsset(overrides))).toThrow('manifest_input_invalid');
+    expect(() => compileMigrationArtifacts(compileWithAsset({ bytes: 0 }, new Uint8Array()))).toThrow('manifest_input_invalid');
   });
 });

@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { isIP } from 'node:net';
 import { types as nodeUtilTypes } from 'node:util';
+import { brotliDecompressSync, inflateSync } from 'node:zlib';
 
 import sharp, { type Metadata } from 'sharp';
 
@@ -268,6 +269,25 @@ function validAssetInput(value: unknown): value is AssetInput {
   return value.authority === 'source_local' ? !Object.hasOwn(value, 'captureReceipt') : value.captureReceipt === undefined || isRecord(value.captureReceipt);
 }
 
+function ipv6Integer(address: string): bigint | null {
+  const normalized = address.toLowerCase().replace(/^\[|\]$/gu, '');
+  if (isIP(normalized) !== 6 || normalized.includes('.')) return null;
+  const halves = normalized.split('::');
+  if (halves.length > 2) return null;
+  const left = halves[0] === '' ? [] : (halves[0] as string).split(':');
+  const right = halves.length === 1 || halves[1] === '' ? [] : (halves[1] as string).split(':');
+  const omitted = 8 - left.length - right.length;
+  if ((halves.length === 1 && omitted !== 0) || (halves.length === 2 && omitted < 1)) return null;
+  const groups = [...left, ...Array.from({ length: omitted }, () => '0'), ...right];
+  if (groups.length !== 8 || groups.some((group) => !/^[0-9a-f]{1,4}$/u.test(group))) return null;
+  return groups.reduce((value, group) => (value << 16n) | BigInt(`0x${group}`), 0n);
+}
+
+function inIpv6Range(value: bigint, prefix: string, bits: number): boolean {
+  const prefixValue = ipv6Integer(prefix);
+  return prefixValue !== null && (value >> BigInt(128 - bits)) === (prefixValue >> BigInt(128 - bits));
+}
+
 function isPublicIpAddress(address: string): boolean {
   const normalized = address.toLowerCase().replace(/^\[|\]$/gu, '');
   const version = isIP(normalized);
@@ -286,7 +306,15 @@ function isPublicIpAddress(address: string): boolean {
     );
   }
   if (version === 6) {
-    return /^[23]/u.test(normalized) && !normalized.startsWith('2001:db8:') && !normalized.startsWith('2001:0db8:');
+    const value = ipv6Integer(normalized);
+    if (value === null || !inIpv6Range(value, '2000::', 3)) return false;
+    return ![
+      ['2001::', 23],
+      ['2001:db8::', 32],
+      ['2002::', 16],
+      ['2620:4f:8000::', 48],
+      ['3fff::', 20],
+    ].some(([prefix, bits]) => inIpv6Range(value, prefix as string, bits as number));
   }
   return false;
 }
@@ -460,27 +488,167 @@ function validRasterContainer(bytes: Uint8Array): boolean {
   return buffer.length >= 16 && buffer.toString('ascii', 4, 8) === 'ftyp' && /avif|avis/u.test(buffer.toString('ascii', 8, 16));
 }
 
+function align4(value: number): number {
+  return (value + 3) & ~3;
+}
+
+function zeroPadding(buffer: Buffer, start: number, end: number): boolean {
+  return end >= start && end <= buffer.length && buffer.subarray(start, end).every((byte) => byte === 0);
+}
+
+function validOptionalBlock(offset: number, length: number, originalLength: number | null, maximum: number): boolean {
+  if (offset === 0) return length === 0 && (originalLength === null || originalLength === 0);
+  return offset % 4 === 0 && length > 0 && length <= maximum && (originalLength === null || (originalLength > 0 && originalLength <= maximum));
+}
+
+function inspectWoff(buffer: Buffer, limits: AssetInventoryLimits): boolean {
+  if (buffer.length < 64 || buffer.readUInt32BE(8) !== buffer.length) return false;
+  const count = buffer.readUInt16BE(12);
+  const totalSfntSize = buffer.readUInt32BE(16);
+  const directoryEnd = 44 + count * 20;
+  if (buffer.readUInt32BE(4) === 0 || count < 1 || count > 64 || buffer.readUInt16BE(14) !== 0 || directoryEnd > buffer.length || totalSfntSize === 0 || totalSfntSize % 4 !== 0 || totalSfntSize > limits.maxFontBytes) return false;
+  const metaOffset = buffer.readUInt32BE(24);
+  const metaLength = buffer.readUInt32BE(28);
+  const metaOrigLength = buffer.readUInt32BE(32);
+  const privateOffset = buffer.readUInt32BE(36);
+  const privateLength = buffer.readUInt32BE(40);
+  if (!validOptionalBlock(metaOffset, metaLength, metaOrigLength, limits.maxFontBytes) || !validOptionalBlock(privateOffset, privateLength, null, limits.maxFontBytes)) return false;
+
+  const tables: Array<{ compressed: number; offset: number; original: number }> = [];
+  let expectedSfntSize = 12 + count * 16;
+  let previousTag = -1;
+  for (let index = 0; index < count; index += 1) {
+    const entry = 44 + index * 20;
+    const tag = buffer.readUInt32BE(entry);
+    const offset = buffer.readUInt32BE(entry + 4);
+    const compressed = buffer.readUInt32BE(entry + 8);
+    const original = buffer.readUInt32BE(entry + 12);
+    if (tag <= previousTag || offset % 4 !== 0 || compressed === 0 || original === 0 || compressed > original || offset > buffer.length - compressed) return false;
+    previousTag = tag;
+    expectedSfntSize += align4(original);
+    if (!Number.isSafeInteger(expectedSfntSize) || expectedSfntSize > limits.maxFontBytes) return false;
+    tables.push({ compressed, offset, original });
+  }
+  if (expectedSfntSize !== totalSfntSize) return false;
+  tables.sort((left, right) => left.offset - right.offset);
+  let cursor = align4(directoryEnd);
+  if (!zeroPadding(buffer, directoryEnd, cursor)) return false;
+  for (const table of tables) {
+    if (table.offset !== cursor) return false;
+    const body = buffer.subarray(table.offset, table.offset + table.compressed);
+    if (table.compressed < table.original) {
+      try {
+        if (inflateSync(body, { maxOutputLength: table.original }).byteLength !== table.original) return false;
+      } catch { return false; }
+    }
+    cursor = align4(table.offset + table.compressed);
+    if (!zeroPadding(buffer, table.offset + table.compressed, cursor)) return false;
+  }
+  if (metaOffset !== 0) {
+    if (metaOffset !== cursor || metaOffset > buffer.length - metaLength) return false;
+    try {
+      if (inflateSync(buffer.subarray(metaOffset, metaOffset + metaLength), { maxOutputLength: metaOrigLength }).byteLength !== metaOrigLength) return false;
+    } catch { return false; }
+    cursor = align4(metaOffset + metaLength);
+    if (!zeroPadding(buffer, metaOffset + metaLength, cursor)) return false;
+  }
+  if (privateOffset !== 0) {
+    if (privateOffset !== cursor || privateOffset > buffer.length - privateLength) return false;
+    cursor = privateOffset + privateLength;
+  }
+  return cursor === buffer.length;
+}
+
+function readUIntBase128(buffer: Buffer, start: number): { next: number; value: number } | null {
+  let value = 0;
+  for (let index = 0; index < 5; index += 1) {
+    const byte = buffer[start + index];
+    if (byte === undefined || (index === 0 && byte === 0x80) || value > 0x01ff_ffff) return null;
+    value = value * 128 + (byte & 0x7f);
+    if ((byte & 0x80) === 0) return { next: start + index + 1, value };
+  }
+  return null;
+}
+
+function inspectWoff2(buffer: Buffer, limits: AssetInventoryLimits): boolean {
+  if (buffer.length < 50 || buffer.readUInt32BE(8) !== buffer.length) return false;
+  const count = buffer.readUInt16BE(12);
+  const totalSfntSize = buffer.readUInt32BE(16);
+  const totalCompressedSize = buffer.readUInt32BE(20);
+  if (buffer.readUInt32BE(4) === 0 || count < 1 || count > 64 || buffer.readUInt16BE(14) !== 0 || totalSfntSize === 0 || totalSfntSize > limits.maxFontBytes || totalCompressedSize === 0 || totalCompressedSize > limits.maxFontBytes) return false;
+  const metaOffset = buffer.readUInt32BE(28);
+  const metaLength = buffer.readUInt32BE(32);
+  const metaOrigLength = buffer.readUInt32BE(36);
+  const privateOffset = buffer.readUInt32BE(40);
+  const privateLength = buffer.readUInt32BE(44);
+  if (!validOptionalBlock(metaOffset, metaLength, metaOrigLength, limits.maxFontBytes) || !validOptionalBlock(privateOffset, privateLength, null, limits.maxFontBytes)) return false;
+
+  const knownTags = ['cmap', 'head', 'hhea', 'hmtx', 'maxp', 'name', 'OS/2', 'post', 'cvt ', 'fpgm', 'glyf', 'loca', 'prep', 'CFF ', 'VORG', 'EBDT', 'EBLC', 'gasp', 'hdmx', 'kern', 'LTSH', 'PCLT', 'VDMX', 'vhea', 'vmtx', 'BASE', 'GDEF', 'GPOS', 'GSUB', 'EBSC', 'JSTF', 'MATH', 'CBDT', 'CBLC', 'COLR', 'CPAL', 'SVG ', 'sbix', 'acnt', 'avar', 'bdat', 'bloc', 'bsln', 'cvar', 'fdsc', 'feat', 'fmtx', 'fvar', 'gvar', 'hsty', 'just', 'lcar', 'mort', 'morx', 'opbd', 'prop', 'trak', 'Zapf', 'Silf', 'Glat', 'Gloc', 'Feat', 'Sill'];
+  const tags = new Set<string>();
+  let cursor = 48;
+  let decompressedSize = 0;
+  for (let index = 0; index < count; index += 1) {
+    const flags = buffer[cursor];
+    if (flags === undefined) return false;
+    cursor += 1;
+    const tagIndex = flags & 0x3f;
+    let tag: string;
+    if (tagIndex === 63) {
+      if (cursor > buffer.length - 4) return false;
+      tag = buffer.toString('ascii', cursor, cursor + 4);
+      if (!/^[\x20-\x7e]{4}$/u.test(tag)) return false;
+      cursor += 4;
+    } else {
+      tag = knownTags[tagIndex] as string;
+    }
+    if (tags.has(tag)) return false;
+    tags.add(tag);
+    const original = readUIntBase128(buffer, cursor);
+    if (original === null || original.value === 0) return false;
+    cursor = original.next;
+    const transformVersion = flags >>> 6;
+    const transformed = tag === 'glyf' || tag === 'loca' ? transformVersion !== 3 : transformVersion !== 0;
+    let storedLength = original.value;
+    if (transformed) {
+      const transform = readUIntBase128(buffer, cursor);
+      if (transform === null || (tag !== 'loca' && transform.value === 0)) return false;
+      cursor = transform.next;
+      storedLength = transform.value;
+    }
+    decompressedSize += storedLength;
+    if (!Number.isSafeInteger(decompressedSize) || decompressedSize > limits.maxFontBytes) return false;
+  }
+  if (cursor > buffer.length - totalCompressedSize) return false;
+  try {
+    if (brotliDecompressSync(buffer.subarray(cursor, cursor + totalCompressedSize), { maxOutputLength: decompressedSize }).byteLength !== decompressedSize) return false;
+  } catch { return false; }
+  cursor += totalCompressedSize;
+  if (metaOffset !== 0) {
+    const aligned = align4(cursor);
+    if (metaOffset !== aligned || !zeroPadding(buffer, cursor, aligned) || metaOffset > buffer.length - metaLength) return false;
+    try {
+      if (brotliDecompressSync(buffer.subarray(metaOffset, metaOffset + metaLength), { maxOutputLength: metaOrigLength }).byteLength !== metaOrigLength) return false;
+    } catch { return false; }
+    cursor = metaOffset + metaLength;
+  }
+  if (privateOffset !== 0) {
+    const aligned = align4(cursor);
+    if (privateOffset !== aligned || !zeroPadding(buffer, cursor, aligned) || privateOffset > buffer.length - privateLength) return false;
+    cursor = privateOffset + privateLength;
+  }
+  return cursor === buffer.length;
+}
+
 function inspectFont(bytes: Uint8Array, license: StructuralFontLicense | undefined, limits: AssetInventoryLimits): { mime: string } | null {
   if (license === undefined || !['OFL-1.1', 'Apache-2.0', 'MIT', 'BSD-3-Clause'].includes(license.spdxId) || !safeToken(license.notice)) return null;
   if (bytes.byteLength > limits.maxFontBytes) return null;
   const buffer = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const signature = buffer.toString('ascii', 0, 4);
   if (signature === 'wOFF') {
-    if (buffer.length < 64 || buffer.readUInt32BE(8) !== buffer.length || buffer.readUInt16BE(12) < 1 || buffer.readUInt16BE(12) > 64 || buffer.readUInt16BE(14) !== 0) return null;
-    const count = buffer.readUInt16BE(12);
-    if (44 + count * 20 > buffer.length) return null;
-    for (let index = 0; index < count; index += 1) {
-      const offset = 44 + index * 20;
-      const dataOffset = buffer.readUInt32BE(offset + 4);
-      const compressed = buffer.readUInt32BE(offset + 8);
-      const original = buffer.readUInt32BE(offset + 12);
-      if (dataOffset % 4 !== 0 || compressed === 0 || original === 0 || compressed > original || dataOffset > buffer.length - compressed) return null;
-    }
-    return { mime: 'font/woff' };
+    return inspectWoff(buffer, limits) ? { mime: 'font/woff' } : null;
   }
   if (signature === 'wOF2') {
-    if (buffer.length < 48 || buffer.readUInt32BE(8) !== buffer.length || buffer.readUInt16BE(12) < 1 || buffer.readUInt16BE(12) > 64 || buffer.readUInt16BE(14) !== 0) return null;
-    return { mime: 'font/woff2' };
+    return inspectWoff2(buffer, limits) ? { mime: 'font/woff2' } : null;
   }
   return null;
 }
@@ -538,17 +706,19 @@ export async function inventoryMigrationAssets(input: AssetInventoryInput): Prom
   const limits = resolveLimits(input.limits);
   if (limits === null) return contentFreeResult('asset_limit_invalid');
   if (!Array.isArray(input.assets)) return contentFreeResult('asset_input_invalid');
+  if (input.assets.length > limits.maxAssets || input.assets.length > limits.maxReferences) return contentFreeResult('asset_policy_blocked');
+  let attemptedBytes = 0;
+  for (const asset of input.assets) {
+    if (asset.authority === 'declared_external') continue;
+    const byteCount = asset.bytes.byteLength;
+    if (byteCount > limits.maxSingleBytes) return contentFreeResult('asset_policy_blocked');
+    attemptedBytes += byteCount;
+    if (!Number.isSafeInteger(attemptedBytes) || attemptedBytes > limits.maxTotalBytes) return contentFreeResult('asset_policy_blocked');
+  }
   const blockerCodes = new Set<AssetInventoryBlockerCode>();
   const block = (code: AssetInventoryBlockerCode): void => {
     if (blockerCodes.size < limits.maxBlockers) blockerCodes.add(code);
   };
-  if (input.assets.length > limits.maxAssets || input.assets.length > limits.maxReferences) block('asset_policy_blocked');
-  let attemptedBytes = 0;
-  for (const asset of input.assets) {
-    if (asset.authority !== 'declared_external' && asset.bytes instanceof Uint8Array) attemptedBytes += asset.bytes.byteLength;
-    if (!Number.isSafeInteger(attemptedBytes) || attemptedBytes > limits.maxTotalBytes) block('asset_policy_blocked');
-  }
-
   const bundled = new Map<string, InventoriedAsset>();
   const structural = new Map<string, InventoriedAsset>();
   const external: DeclaredExternalAsset[] = [];

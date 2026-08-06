@@ -183,6 +183,16 @@ const SOURCE_KINDS = new Set<ManagedContentSourceKind>(['jsx', 'json', 'typescri
 const VALUE_TYPES = new Set<ManagedContentValueType>(['string', 'rich_text', 'url', 'email', 'telephone', 'image', 'collection']);
 const INPUT_KEYS = ['assets', 'candidateDigest', 'cmsNativeProtocol', 'extraction', 'migrationId', 'policy', 'routes', 'sourceDigest', 'websiteId'];
 const MAX_TARGETS = 500;
+const MAX_ROUTES = 500;
+const MAX_THIRD_PARTY_BOUNDARIES = 100;
+const MAX_PRIVATE_DECLARATIONS = 500;
+const MAX_ASSET_RECORDS = 500;
+const MAX_ASSET_REFERENCES = 2_000;
+const MAX_SINGLE_ASSET_BYTES = 20_000_000;
+const MAX_TOTAL_ASSET_BYTES = 100_000_000;
+const MAX_ASSET_DIMENSION = 16_384;
+const MAX_ASSET_PIXELS = 40_000_000;
+const MAX_ASSET_FRAMES = 256;
 const MAX_STRING = 2_000;
 const MAX_COLLECTION_ITEMS = 1_000;
 const EXTRACTION_KEYS = ['derived', 'needsAttention', 'status', 'structural', 'structuredFamilies', 'targets', 'thirdPartyBoundaries', 'values'];
@@ -253,6 +263,25 @@ function validRoute(route: unknown): route is MigrationRouteV1 {
   return !route.path.split('/').some((segment, index) => index > 0 && (segment === '' || segment === '.' || segment === '..')) || route.path === '/';
 }
 
+function ipv6Integer(address: string): bigint | null {
+  const normalized = address.toLowerCase().replace(/^\[|\]$/gu, '');
+  if (isIP(normalized) !== 6 || normalized.includes('.')) return null;
+  const halves = normalized.split('::');
+  if (halves.length > 2) return null;
+  const left = halves[0] === '' ? [] : (halves[0] as string).split(':');
+  const right = halves.length === 1 || halves[1] === '' ? [] : (halves[1] as string).split(':');
+  const omitted = 8 - left.length - right.length;
+  if ((halves.length === 1 && omitted !== 0) || (halves.length === 2 && omitted < 1)) return null;
+  const groups = [...left, ...Array.from({ length: omitted }, () => '0'), ...right];
+  if (groups.length !== 8 || groups.some((group) => !/^[0-9a-f]{1,4}$/u.test(group))) return null;
+  return groups.reduce((value, group) => (value << 16n) | BigInt(`0x${group}`), 0n);
+}
+
+function inIpv6Range(value: bigint, prefix: string, bits: number): boolean {
+  const prefixValue = ipv6Integer(prefix);
+  return prefixValue !== null && (value >> BigInt(128 - bits)) === (prefixValue >> BigInt(128 - bits));
+}
+
 function isPublicIpAddress(address: string): boolean {
   const normalized = address.toLowerCase().replace(/^\[|\]$/gu, '');
   const version = isIP(normalized);
@@ -264,7 +293,13 @@ function isPublicIpAddress(address: string): boolean {
       (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && (b === 0 || b === 168)) ||
       (a === 198 && (b === 18 || b === 19 || b === 51)) || (a === 203 && b === 0));
   }
-  if (version === 6) return /^[23]/u.test(normalized) && !normalized.startsWith('2001:db8:') && !normalized.startsWith('2001:0db8:');
+  if (version === 6) {
+    const value = ipv6Integer(normalized);
+    if (value === null || !inIpv6Range(value, '2000::', 3)) return false;
+    return ![
+      ['2001::', 23], ['2001:db8::', 32], ['2002::', 16], ['2620:4f:8000::', 48], ['3fff::', 20],
+    ].some(([prefix, bits]) => inIpv6Range(value, prefix as string, bits as number));
+  }
   return false;
 }
 
@@ -292,6 +327,10 @@ function validateRoot(input: CompileMigrationArtifactsInput): void {
       !isPlainArray(input.extraction.derived) || !isPlainArray(input.extraction.structural) || !isPlainArray(input.extraction.needsAttention)) fail('manifest_input_invalid');
   if (!exactKeys(input.assets, ASSET_INVENTORY_KEYS) || !isPlainArray(input.assets.bundled) || !isPlainArray(input.assets.structural) ||
       !isPlainArray(input.assets.external) || !isPlainArray(input.assets.blockers)) fail('manifest_input_invalid');
+  if (input.routes.length > MAX_ROUTES) fail('manifest_route_limit_exceeded');
+  if (input.extraction.thirdPartyBoundaries.length > MAX_THIRD_PARTY_BOUNDARIES || input.extraction.derived.length > MAX_PRIVATE_DECLARATIONS ||
+      input.extraction.structural.length > MAX_PRIVATE_DECLARATIONS) fail('manifest_declaration_limit_exceeded');
+  if (input.assets.bundled.length + input.assets.structural.length + input.assets.external.length > MAX_ASSET_RECORDS) fail('manifest_asset_limit_exceeded');
 }
 
 function routeMap(input: CompileMigrationArtifactsInput): Map<string, MigrationRouteV1> {
@@ -360,7 +399,7 @@ function collectionDetails(input: CompileMigrationArtifactsInput, targets: Reado
   for (const policy of input.policy.collectionPolicy) {
     if (!isRecord(policy) || !exactKeys(policy, ['key', 'locale', 'maximumItems', 'minimumItems', 'requiredItemIds', 'variant']) || !validIdentity(policy) ||
         !Number.isSafeInteger(policy.minimumItems) || !Number.isSafeInteger(policy.maximumItems) || policy.minimumItems < 0 || policy.maximumItems < policy.minimumItems || policy.maximumItems > MAX_COLLECTION_ITEMS ||
-        !isPlainArray(policy.requiredItemIds) || policy.requiredItemIds.some((id) => !safeString(id, 200)) || new Set(policy.requiredItemIds).size !== policy.requiredItemIds.length) fail('manifest_collection_invalid');
+        !isPlainArray(policy.requiredItemIds) || policy.requiredItemIds.length > MAX_COLLECTION_ITEMS || policy.requiredItemIds.some((id) => !safeString(id, 200)) || new Set(policy.requiredItemIds).size !== policy.requiredItemIds.length) fail('manifest_collection_invalid');
     const id = identityKey(policy);
     if (policies.has(id)) fail('manifest_collection_invalid');
     policies.set(id, policy);
@@ -445,9 +484,18 @@ function validInventoriedAsset(asset: unknown, classification: 'editorial_cms' |
   if (!isRecord(asset)) return false;
   const optional = [...(Object.hasOwn(asset, 'fontLicense') ? ['fontLicense'] : []), ...(Object.hasOwn(asset, 'sanitizerPolicy') ? ['sanitizerPolicy'] : [])];
   if (!exactKeys(asset, ['animated', 'bytes', 'bytesValue', 'digest', 'encodedHeight', 'encodedWidth', 'mime', 'pageCount', 'references', 'renderedHeight', 'renderedWidth', ...optional]) ||
-      !validDigest(asset.digest) || !(asset.bytesValue instanceof Uint8Array) || nodeUtilTypes.isProxy(asset.bytesValue) || asset.bytes !== asset.bytesValue.byteLength || digestBytes(asset.bytesValue) !== asset.digest ||
+      !validDigest(asset.digest) || !(asset.bytesValue instanceof Uint8Array) || nodeUtilTypes.isProxy(asset.bytesValue) || !Number.isSafeInteger(asset.bytes) || (asset.bytes as number) <= 0 || (asset.bytes as number) > MAX_SINGLE_ASSET_BYTES || asset.bytes !== asset.bytesValue.byteLength || digestBytes(asset.bytesValue) !== asset.digest ||
       !safeString(asset.mime, 100) || typeof asset.animated !== 'boolean' || !isPlainArray(asset.references) || asset.references.length === 0 ||
-      ![asset.encodedWidth, asset.encodedHeight, asset.renderedWidth, asset.renderedHeight, asset.pageCount].every(Number.isSafeInteger)) return false;
+      ![asset.encodedWidth, asset.encodedHeight, asset.renderedWidth, asset.renderedHeight, asset.pageCount].every((value) => Number.isSafeInteger(value) && (value as number) >= 0)) return false;
+  const font = asset.mime === 'font/woff' || asset.mime === 'font/woff2';
+  if (font) {
+    if (classification !== 'structural_git' || asset.encodedWidth !== 0 || asset.encodedHeight !== 0 || asset.renderedWidth !== 0 || asset.renderedHeight !== 0 || asset.pageCount !== 0 || asset.animated !== false || asset.fontLicense === undefined) return false;
+  } else {
+    if (!['image/avif', 'image/gif', 'image/jpeg', 'image/png', 'image/svg+xml', 'image/webp'].includes(asset.mime as string) ||
+        (asset.encodedWidth as number) <= 0 || (asset.encodedHeight as number) <= 0 || (asset.renderedWidth as number) <= 0 || (asset.renderedHeight as number) <= 0 || (asset.pageCount as number) <= 0 ||
+        (asset.encodedWidth as number) > MAX_ASSET_DIMENSION || (asset.encodedHeight as number) > MAX_ASSET_DIMENSION || (asset.renderedWidth as number) > MAX_ASSET_DIMENSION || (asset.renderedHeight as number) > MAX_ASSET_DIMENSION ||
+        (asset.renderedWidth as number) * (asset.renderedHeight as number) > MAX_ASSET_PIXELS || (asset.pageCount as number) > MAX_ASSET_FRAMES || asset.animated !== ((asset.pageCount as number) > 1)) return false;
+  }
   if (asset.references.some((reference) => !validAssetReference(reference, classification))) return false;
   if (asset.sanitizerPolicy !== undefined && (!isRecord(asset.sanitizerPolicy) || !exactKeys(asset.sanitizerPolicy, ['digest', 'version']) || asset.sanitizerPolicy.version !== 'move-to-verow.svg-safety.v1' || !validDigest(asset.sanitizerPolicy.digest))) return false;
   if (asset.fontLicense !== undefined && (!isRecord(asset.fontLicense) || !exactKeys(asset.fontLicense, ['notice', 'spdxId']) || !safeString(asset.fontLicense.notice) || !['OFL-1.1', 'Apache-2.0', 'MIT', 'BSD-3-Clause'].includes(asset.fontLicense.spdxId as string))) return false;
@@ -456,6 +504,16 @@ function validInventoriedAsset(asset: unknown, classification: 'editorial_cms' |
 
 function validateReadyAssetInventory(input: CompileMigrationArtifactsInput): void {
   if (input.assets.status !== 'ready' || input.assets.blockers.length > 0) fail('manifest_assets_blocked');
+  let totalBytes = 0;
+  let totalReferences = 0;
+  for (const asset of [...input.assets.bundled, ...input.assets.structural]) {
+    if (!isRecord(asset) || !Number.isSafeInteger(asset.bytes) || (asset.bytes as number) <= 0 || (asset.bytes as number) > MAX_SINGLE_ASSET_BYTES || !isPlainArray(asset.references)) fail('manifest_input_invalid');
+    totalBytes += asset.bytes as number;
+    totalReferences += asset.references.length;
+    if (!Number.isSafeInteger(totalBytes) || totalBytes > MAX_TOTAL_ASSET_BYTES || totalReferences > MAX_ASSET_REFERENCES) fail('manifest_asset_limit_exceeded');
+  }
+  totalReferences += input.assets.external.length;
+  if (totalReferences > MAX_ASSET_REFERENCES) fail('manifest_asset_limit_exceeded');
   if (input.assets.bundled.some((asset) => !validInventoriedAsset(asset, 'editorial_cms')) ||
       input.assets.structural.some((asset) => !validInventoriedAsset(asset, 'structural_git'))) fail('manifest_input_invalid');
   for (const asset of input.assets.external) {
