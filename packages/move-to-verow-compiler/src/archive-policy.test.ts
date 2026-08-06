@@ -359,6 +359,69 @@ describe('migration archive admission policy', () => {
   });
 
   it.each([
+    'config/SSHPRIVATEKEY',
+    'config/KEYSTOREPASSWORD',
+    'config/TRUSTSTOREPASSWORD',
+    'config/SECRETKEYBASE',
+    'config/GOOGLEAPPLICATIONCREDENTIALS',
+    'config/CLIENTCERTIFICATEPASSWORD',
+    'config/DATABASECONNECTIONPASSWORD',
+    'config/PRODUCTIONAPIKEY',
+    'config/APIKEYPRODUCTION',
+    'config/LIVECLIENTSECRET',
+    'config/STAGINGTOKEN',
+    'config/STAGETOKEN',
+    'config/DEVELOPMENTAPIKEY',
+    'config/DEVCLIENTSECRET',
+    'config/TESTCREDENTIALS',
+    'config/TESTINGPASSWORD',
+    'config/LOCALTOKEN',
+    'config/RELEASEKEY',
+    'config/PRODCREDENTIALS',
+  ])('rejects reviewed credential/context compound %s in either order', (path) => {
+    expect(() => assertArchiveEntries([entry(path)])).toThrow(/^bundle_entry_forbidden$/u);
+  });
+
+  it.each([
+    'config/TOKENCOUNTSECRET',
+    'config/TOKENBUCKETKEY',
+    'config/SECRETSANTAKEYS',
+    'config/DESIGNTOKENCOUNTSECRET',
+  ])('rejects residual sensitive word after a concatenated benign unit in %s', (path) => {
+    expect(() => assertArchiveEntries([entry(path)])).toThrow(/^bundle_entry_forbidden$/u);
+  });
+
+  it.each([
+    'config/DESIGNTOKEN',
+    'config/DESIGNTOKENS',
+    'config/TOKENCOUNT',
+    'config/TOKENBUCKET',
+    'config/SECRETSANTA',
+  ])('admits exact concatenated benign credential-like unit %s', (path) => {
+    expect(() => assertArchiveEntries([entry(path)])).not.toThrow();
+  });
+
+  it.each([
+    'config/PRODUCTAPIKEY',
+    'config/LIVELYCLIENTSECRETARY',
+    'config/STAGEDTOKENIZER',
+    'config/DEVELOPERKEYNOTE',
+    'config/LOCALITYPASSWORDLESS',
+    'config/RELEASESKEYBOARD',
+    'config/TESTAMENTKEYNOTE',
+  ])('admits qualifier near-neighbor %s without substring classification', (path) => {
+    expect(() => assertArchiveEntries([entry(path)])).not.toThrow();
+  });
+
+  it.each([
+    `config/${'AWS'.repeat(7)}KEY`,
+    `config/${'AWS'.repeat(8)}KEY`,
+    `config/${'AWS'.repeat(9)}KEY`,
+  ])('fails closed for fully recognized credential compound at and beyond the word bound: %s', (path) => {
+    expect(() => assertArchiveEntries([entry(path)])).toThrow(/^bundle_entry_forbidden$/u);
+  });
+
+  it.each([
     'config/MONKEY.json',
     'config/KEYBOARD.yaml',
     'config/APIKEYBOARD.toml',
@@ -368,6 +431,32 @@ describe('migration archive admission policy', () => {
     'config/MASTERKEYBOARD',
     'config/KEYSTONE',
   ])('admits uppercase near-neighbor %s that is not an exact credential compound', (path) => {
+    expect(() => assertArchiveEntries([entry(path)])).not.toThrow();
+  });
+
+  it.each([
+    'config/.npmrc.ts',
+    'config/.pypirc.test.tsx',
+    'config/.netrc.client.js',
+    'config/.git-credentials.generated.mjs',
+    'keys/id_rsa.spec.ts',
+    'keys/id_ed25519.ts',
+    'repo/.docker/config.json.test.ts',
+    'repo/.kube/config.client.tsx',
+    'repo/.config/gh/hosts.yml.generated.js',
+    'config/.ＮＰＭＲＣ.ＴＳ',
+    'repo/.ＤＯＣＫＥＲ/config.ＪＳＯＮ.fixture.ＴＳＸ',
+  ])('rejects exact canonical credential path %s behind reviewed source suffixes', (path) => {
+    expect(() => assertArchiveEntries([entry(path)])).toThrow(/^bundle_entry_forbidden$/u);
+  });
+
+  it.each([
+    'src/.npmrc-reader.ts',
+    'src/id_rsa_parser.ts',
+    'src/docker-config.ts',
+    'src/kube-config.ts',
+    'src/hosts-yml.ts',
+  ])('admits legitimate source near-neighbor %s of an exact credential path', (path) => {
     expect(() => assertArchiveEntries([entry(path)])).not.toThrow();
   });
 
@@ -396,6 +485,16 @@ describe('migration archive admission policy', () => {
     'public/logo.ico',
     'public/key.ico',
   ])('keeps unsupported ICO candidate %s blocked', (path) => {
+    expect(() => assertArchiveEntries([entry(path)])).toThrow(/^bundle_entry_forbidden$/u);
+  });
+
+  it.each([
+    'public/logo.ＩＣＯ',
+    'public/logo．ico',
+    'fixtures/fixture.ＺＩＰ',
+    'bin/program.ＥＸＥ',
+    'fixtures/fixture．ＰＤＦ',
+  ])('rejects canonical compatibility alias of denylisted suffix %s', (path) => {
     expect(() => assertArchiveEntries([entry(path)])).toThrow(/^bundle_entry_forbidden$/u);
   });
 

@@ -215,35 +215,56 @@ const CREDENTIAL_SENSITIVE_TOKENS = new Set([
 const CREDENTIAL_COMPOUND_PREFIXES = [
   'access',
   'api',
+  'application',
   'auth',
   'authentication',
   'authorization',
   'aws',
   'azure',
+  'base',
   'bearer',
+  'bucket',
+  'certificate',
   'client',
   'cloudflare',
+  'connection',
+  'count',
   'database',
   'db',
+  'dev',
+  'development',
   'encryption',
   'firebase',
   'github',
   'gitlab',
   'google',
+  'keystore',
+  'live',
+  'local',
   'master',
   'netlify',
   'npm',
   'oauth',
   'openai',
   'private',
+  'prod',
+  'production',
   'refresh',
+  'release',
+  'santa',
   'sanity',
   'sendgrid',
   'service',
   'session',
   'signing',
+  'ssh',
+  'stage',
+  'staging',
   'stripe',
   'supabase',
+  'test',
+  'testing',
+  'truststore',
   'user',
   'vercel',
 ] as const;
@@ -254,7 +275,7 @@ const CREDENTIAL_COMPOUND_WORDS = [...new Set([
   'design',
   'id',
 ])].sort((left, right) => right.length - left.length || compareUtf8(left, right));
-const MAX_CREDENTIAL_COMPOUND_CHARACTERS = 80;
+const MAX_CREDENTIAL_COMPOUND_CHARACTERS = ARCHIVE_LIMITS.maxSegmentBytes;
 const MAX_CREDENTIAL_COMPOUND_WORDS = 8;
 const SUPPORTED_CANDIDATE_ASSET_MIMES = Object.freeze({
   avif: 'image/avif',
@@ -320,6 +341,22 @@ const EXECUTABLE_EXTENSIONS = new Set(['.cjs', '.js', '.mjs', '.sh', '.ts']);
 export interface SupportedCandidateAssetClassification {
   suffix: keyof typeof SUPPORTED_CANDIDATE_ASSET_MIMES;
   mime: (typeof SUPPORTED_CANDIDATE_ASSET_MIMES)[keyof typeof SUPPORTED_CANDIDATE_ASSET_MIMES];
+}
+
+interface CanonicalCandidatePath {
+  path: string;
+  segments: readonly string[];
+  basename: string;
+}
+
+type CredentialCompoundSegmentation =
+  | { kind: 'opaque' }
+  | { kind: 'over_bound' }
+  | { kind: 'parsed'; words: readonly string[] };
+
+interface CredentialBasenameTokens {
+  tokens: readonly string[];
+  hasOverBoundCompound: boolean;
 }
 
 function fail(code: 'bundle_entry_forbidden' | 'bundle_input_invalid' | 'bundle_limit_exceeded'): never {
@@ -406,53 +443,76 @@ function extension(path: string): string {
   return dot < 0 ? '' : name.slice(dot).toLowerCase();
 }
 
-export function classifySupportedCandidateAsset(
-  path: string,
+function canonicalCandidatePath(path: string): CanonicalCandidatePath {
+  const canonicalPath = path.normalize('NFKC').toLowerCase();
+  const segments = canonicalPath.split('/');
+  return {
+    path: canonicalPath,
+    segments,
+    basename: segments.at(-1) ?? '',
+  };
+}
+
+function classifySupportedCanonicalCandidateAsset(
+  path: CanonicalCandidatePath,
 ): SupportedCandidateAssetClassification | null {
-  const basename = path.slice(path.lastIndexOf('/') + 1).normalize('NFKC').toLowerCase();
-  const dot = basename.lastIndexOf('.');
-  const suffix = dot < 0 ? '' : basename.slice(dot + 1);
+  const dot = path.basename.lastIndexOf('.');
+  const suffix = dot < 0 ? '' : path.basename.slice(dot + 1);
   if (!Object.hasOwn(SUPPORTED_CANDIDATE_ASSET_MIMES, suffix)) return null;
   const supportedSuffix = suffix as keyof typeof SUPPORTED_CANDIDATE_ASSET_MIMES;
   return { suffix: supportedSuffix, mime: SUPPORTED_CANDIDATE_ASSET_MIMES[supportedSuffix] };
+}
+
+export function classifySupportedCandidateAsset(
+  path: string,
+): SupportedCandidateAssetClassification | null {
+  return classifySupportedCanonicalCandidateAsset(canonicalCandidatePath(path));
 }
 
 function hasPathSuffix(path: string, suffix: string): boolean {
   return path === suffix || path.endsWith(`/${suffix}`);
 }
 
-function segmentCredentialCompound(token: string): string[] | null {
-  if (token.length === 0 || token.length > MAX_CREDENTIAL_COMPOUND_CHARACTERS) return null;
-  const memo = new Map<string, string[] | null>();
-  function visit(offset: number, remainingWords: number): string[] | null {
-    if (offset === token.length) return [];
-    if (remainingWords === 0) return null;
-    const cacheKey = `${offset}\u0000${remainingWords}`;
-    if (memo.has(cacheKey)) return memo.get(cacheKey) ?? null;
+function segmentCredentialCompound(token: string): CredentialCompoundSegmentation {
+  if (token.length === 0 || token.length > MAX_CREDENTIAL_COMPOUND_CHARACTERS) {
+    return { kind: 'opaque' };
+  }
+  const shortestAtOffset: Array<readonly string[] | undefined> = Array.from(
+    { length: token.length + 1 },
+    () => undefined,
+  );
+  shortestAtOffset[0] = [];
+  for (let offset = 0; offset < token.length; offset += 1) {
+    const prefix = shortestAtOffset[offset];
+    if (prefix === undefined) continue;
     for (const word of CREDENTIAL_COMPOUND_WORDS) {
       if (!token.startsWith(word, offset)) continue;
-      const suffix = visit(offset + word.length, remainingWords - 1);
-      if (suffix !== null) {
-        const result = [word, ...suffix];
-        memo.set(cacheKey, result);
-        return result;
+      const nextOffset = offset + word.length;
+      const existing = shortestAtOffset[nextOffset];
+      if (existing === undefined || prefix.length + 1 < existing.length) {
+        shortestAtOffset[nextOffset] = [...prefix, word];
       }
     }
-    memo.set(cacheKey, null);
-    return null;
   }
-  return visit(0, MAX_CREDENTIAL_COMPOUND_WORDS);
+  const words = shortestAtOffset[token.length];
+  if (words === undefined) return { kind: 'opaque' };
+  if (words.length > MAX_CREDENTIAL_COMPOUND_WORDS) return { kind: 'over_bound' };
+  return { kind: 'parsed', words };
 }
 
-function tokenizeCredentialBasename(name: string): string[] {
-  const canonical = name
-    .replace(/([a-z0-9])([A-Z])/gu, '$1 $2')
-    .replace(/([A-Z]+)([A-Z][a-z])/gu, '$1 $2')
-    .toLowerCase();
-  return canonical
-    .split(/[\p{P}\p{Z}\s]+/u)
-    .filter(Boolean)
-    .flatMap((token) => segmentCredentialCompound(token) ?? [token]);
+function tokenizeCanonicalCredentialBasename(name: string): CredentialBasenameTokens {
+  const tokens: string[] = [];
+  let hasOverBoundCompound = false;
+  for (const token of name.split(/[\p{P}\p{Z}\s]+/u).filter(Boolean)) {
+    const segmentation = segmentCredentialCompound(token);
+    if (segmentation.kind === 'parsed') {
+      tokens.push(...segmentation.words);
+    } else {
+      tokens.push(token);
+      hasOverBoundCompound ||= segmentation.kind === 'over_bound';
+    }
+  }
+  return { tokens, hasOverBoundCompound };
 }
 
 function consumedBenignCredentialTokens(tokens: readonly string[]): Set<number> {
@@ -472,26 +532,28 @@ function consumedBenignCredentialTokens(tokens: readonly string[]): Set<number> 
 }
 
 function hasCredentialBasename(name: string): boolean {
-  const compatibilityName = name.normalize('NFKC');
-  if (classifySupportedCandidateAsset(compatibilityName) !== null) return false;
-  const dot = compatibilityName.lastIndexOf('.');
-  const finalExtension = dot > 0 ? compatibilityName.slice(dot + 1).toLowerCase() : '';
-  let classifiedName = compatibilityName;
+  const dot = name.lastIndexOf('.');
+  const finalExtension = dot > 0 ? name.slice(dot + 1) : '';
+  let classifiedName = name;
   if (CREDENTIAL_SOURCE_EXTENSIONS.has(finalExtension)) {
-    const preSourceName = compatibilityName.slice(0, dot);
+    const preSourceName = name.slice(0, dot);
     const hasRiskyInnerExtension = preSourceName
       .split('.')
       .slice(1)
-      .some((suffix) => CREDENTIAL_INNER_RISK_EXTENSIONS.has(suffix.toLowerCase()));
+      .some((suffix) => CREDENTIAL_INNER_RISK_EXTENSIONS.has(suffix));
     if (!hasRiskyInnerExtension) return false;
     classifiedName = preSourceName;
   }
-  const tokens = tokenizeCredentialBasename(classifiedName);
+  const tokenized = tokenizeCanonicalCredentialBasename(classifiedName);
+  if (tokenized.hasOverBoundCompound) return true;
+  const tokens = tokenized.tokens;
   if (tokens.length === 0) return false;
   const classifiedDot = classifiedName.lastIndexOf('.');
-  const basenameTokens = tokenizeCredentialBasename(
+  const tokenizedBasename = tokenizeCanonicalCredentialBasename(
     classifiedDot > 0 ? classifiedName.slice(0, classifiedDot) : classifiedName,
   );
+  if (tokenizedBasename.hasOverBoundCompound) return true;
+  const basenameTokens = tokenizedBasename.tokens;
   if (
     basenameTokens.length === 1 &&
     CREDENTIAL_SINGLETON_TOKENS.has(basenameTokens[0] as string)
@@ -520,20 +582,43 @@ function hasCredentialBasename(name: string): boolean {
   return false;
 }
 
+function exactCredentialPathCandidates(path: CanonicalCandidatePath): readonly string[] {
+  const dot = path.basename.lastIndexOf('.');
+  const finalExtension = dot > 0 ? path.basename.slice(dot + 1) : '';
+  if (!CREDENTIAL_SOURCE_EXTENSIONS.has(finalExtension)) return [path.path];
+  const directory = path.path.slice(0, path.path.length - path.basename.length);
+  const candidates = [path.path];
+  let stem = path.basename.slice(0, dot);
+  while (stem.length > 0) {
+    candidates.push(`${directory}${stem}`);
+    const previousDot = stem.lastIndexOf('.');
+    if (previousDot <= 0) break;
+    stem = stem.slice(0, previousDot);
+  }
+  return candidates;
+}
+
+function hasExactCredentialPath(path: CanonicalCandidatePath): boolean {
+  return exactCredentialPathCandidates(path).some((candidate) => {
+    const basename = candidate.slice(candidate.lastIndexOf('/') + 1);
+    return FORBIDDEN_NAMES.has(basename) ||
+      STANDARD_CREDENTIAL_PATHS.some((suffix) => hasPathSuffix(candidate, suffix));
+  });
+}
+
 function forbiddenName(path: string): boolean {
-  const segments = path.split('/');
-  const lower = segments.map((segment) => segment.toLowerCase());
-  const lowerPath = lower.join('/');
-  const rawName = segments.at(-1) ?? '';
-  const name = lower.at(-1) ?? '';
-  if (lower.some((segment) => FORBIDDEN_SEGMENTS.has(segment))) return true;
-  if (STANDARD_CREDENTIAL_PATHS.some((suffix) => hasPathSuffix(lowerPath, suffix))) return true;
-  if (FORBIDDEN_NAMES.has(name)) return true;
+  const canonical = canonicalCandidatePath(path);
+  const name = canonical.basename;
+  if (canonical.segments.some((segment) => FORBIDDEN_SEGMENTS.has(segment))) return true;
+  if (hasExactCredentialPath(canonical)) return true;
   if (name === '.env' || name.startsWith('.env.') || name === '.dev.vars' || name.startsWith('.dev.vars.')) return true;
   if (name.endsWith('.pem') || name.endsWith('.key') || name.endsWith('.p12') || name.endsWith('.pfx')) return true;
   if (name.endsWith('.tfstate') || name.endsWith('.tfstate.backup')) return true;
   if (/^(?:task-|compiler-).*(?:receipt|report).*\.json$/u.test(name)) return true;
-  if (hasCredentialBasename(rawName)) return true;
+  if (
+    classifySupportedCanonicalCandidateAsset(canonical) === null &&
+    hasCredentialBasename(name)
+  ) return true;
   return BLOCKED_FORMATS.some(({ extensions }) => extensions.some((suffix) => name.endsWith(suffix))) ||
     UNSAFE_BINARY_PATTERN.test(name);
 }
