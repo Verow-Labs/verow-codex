@@ -94,22 +94,30 @@ const STANDARD_CREDENTIAL_PATHS = [
   '.kube/config',
   'composer/auth.json',
 ] as const;
-const CREDENTIAL_DATA_EXTENSIONS = new Set([
-  '',
-  'db',
-  'env',
-  'ini',
-  'json',
-  'toml',
-  'txt',
-  'yaml',
-  'yml',
+// V1 emits a Next.js web repository. Only executable JS/TS modules, React source,
+// web styles, HTML, and Markdown are treated as source; data, config, extensionless,
+// and unknown formats remain fail-closed for credential-like basenames.
+const CREDENTIAL_SOURCE_EXTENSIONS = new Set([
+  'cjs',
+  'css',
+  'html',
+  'js',
+  'jsx',
+  'less',
+  'md',
+  'mdx',
+  'mjs',
+  'sass',
+  'scss',
+  'ts',
+  'tsx',
 ]);
 const CREDENTIAL_SINGLETON_TOKENS = new Set([
   'auth',
   'credential',
   'credentials',
   'key',
+  'keys',
   'secret',
   'secrets',
   'token',
@@ -155,45 +163,15 @@ const CREDENTIAL_TOKEN_PAIRS = new Set([
   'service:token',
   'service:tokens',
 ]);
-const CREDENTIAL_PROVIDER_TOKENS = new Set([
-  'aws',
-  'azure',
-  'cloudflare',
-  'firebase',
-  'github',
-  'gitlab',
-  'google',
-  'netlify',
-  'npm',
-  'openai',
-  'sanity',
-  'sendgrid',
-  'stripe',
-  'supabase',
-  'vercel',
-]);
 const CREDENTIAL_SENSITIVE_TOKENS = new Set([
   'credential',
   'credentials',
   'key',
+  'keys',
   'secret',
   'secrets',
   'token',
   'tokens',
-]);
-const CREDENTIAL_CONTEXT_TOKENS = new Set([
-  'access',
-  'api',
-  'auth',
-  'authentication',
-  'authorization',
-  'bearer',
-  'client',
-  'oauth',
-  'private',
-  'refresh',
-  'service',
-  'session',
 ]);
 const PDF_PREFIX_WHITESPACE = new Set([0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x20]);
 interface BlockedFormat {
@@ -366,7 +344,7 @@ function consumedBenignCredentialTokens(tokens: readonly string[]): Set<number> 
 
 function hasCredentialBasename(name: string): boolean {
   const { extension, tokens } = credentialBasenameTokens(name);
-  if (!CREDENTIAL_DATA_EXTENSIONS.has(extension) || tokens.length === 0) return false;
+  if (CREDENTIAL_SOURCE_EXTENSIONS.has(extension) || tokens.length === 0) return false;
   if (tokens.length === 1 && CREDENTIAL_SINGLETON_TOKENS.has(tokens[0] as string)) {
     return true;
   }
@@ -374,13 +352,7 @@ function hasCredentialBasename(name: string): boolean {
   const hasUnconsumedSensitiveToken = tokens.some(
     (token, index) => CREDENTIAL_SENSITIVE_TOKENS.has(token) && !consumed.has(index),
   );
-  if (
-    hasUnconsumedSensitiveToken &&
-    (tokens.some((token) => CREDENTIAL_PROVIDER_TOKENS.has(token)) ||
-      tokens.some((token) => CREDENTIAL_CONTEXT_TOKENS.has(token)))
-  ) {
-    return true;
-  }
+  if (hasUnconsumedSensitiveToken) return true;
   for (let index = 0; index + 1 < tokens.length; index += 1) {
     const pair = `${tokens[index]}:${tokens[index + 1]}`;
     if (

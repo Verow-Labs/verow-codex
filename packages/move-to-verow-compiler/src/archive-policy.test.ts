@@ -227,6 +227,59 @@ describe('migration archive admission policy', () => {
     expect(() => assertArchiveEntries([entry(path)])).toThrow(/^bundle_entry_forbidden$/u);
   });
 
+  it.each([
+    'config/keys',
+    'config/keys.json',
+    'config/api-keys.yaml',
+    'config/client-keys.toml',
+    'config/private-keys.ini',
+    'config/access-keys.txt',
+    'config/production-key',
+    'config/live-secret',
+    'config/staging-token',
+    'config/prod-credentials',
+    'config/key.local',
+    'config/secret.production',
+    'config/token.release',
+    'config/design-token-secret',
+    'config/token-bucket-key',
+    'config/secret-santa-keys.custom',
+  ])('rejects every residual sensitive token in non-source basename %s', (path) => {
+    expect(() => assertArchiveEntries([entry(path)])).toThrow(/^bundle_entry_forbidden$/u);
+  });
+
+  it.each([
+    'src/auth-token.js',
+    'src/auth-token.jsx',
+    'src/auth-token.ts',
+    'src/auth-token.tsx',
+    'src/auth-token.cjs',
+    'src/auth-token.mjs',
+    'styles/design-token-secret.css',
+    'styles/design-token-secret.scss',
+    'styles/design-token-secret.sass',
+    'styles/design-token-secret.less',
+    'pages/client-secret.html',
+    'docs/private-key.md',
+    'docs/private-key.mdx',
+  ])('admits credential-like source basename %s only for a reviewed source extension', (path) => {
+    expect(() => assertArchiveEntries([entry(path)])).not.toThrow();
+  });
+
+  it.each([
+    'config/design-token.release',
+    'config/design-tokens.custom',
+    'config/token-bucket.local',
+    'config/token-count.production',
+    'config/secret-santa.stage',
+    'config/keyframes.local',
+    'config/tokenizer.production',
+    'config/secretary.release',
+    'config/authentication.json',
+  ])('admits non-source basename %s when no unconsumed sensitive token remains', (path) => {
+    expect(() => assertArchiveEntries([entry(path)])).not.toThrow();
+  });
+
   it('rejects generated provider state roots but admits similarly named source paths', () => {
     for (const path of [
       '.netlify/state.json',
