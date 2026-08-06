@@ -383,6 +383,83 @@ describe('migration archive admission policy', () => {
   });
 
   it.each([
+    'config/BETAAPIKEY',
+    'config/APIKEYBETA',
+    'config/BETASERVICESECRET',
+    'config/SESSIONBETACREDENTIALS',
+    'config/BetaClientSecret',
+    'config/ＢＥＴＡＡＰＩＫＥＹ',
+    'config/SESSIONＢＥＴＡCREDENTIALS',
+  ])('rejects beta-qualified credential compound %s in prefix, suffix, and multi-context forms', (path) => {
+    expect(() => assertArchiveEntries([entry(path)])).toThrow(/^bundle_entry_forbidden$/u);
+  });
+
+  it.each([
+    'config/BETAMAX',
+    'config/BETTERAPIKEY',
+    'config/BETACLIENTSECRETARY',
+    'config/BETATOKENIZER',
+    'config/beta-release-notes',
+  ])('admits benign beta near-neighbor %s without substring classification', (path) => {
+    expect(() => assertArchiveEntries([entry(path)])).not.toThrow();
+  });
+
+  it.each([
+    'config/JWTSECRET',
+    'config/WEBHOOKSECRET',
+    'config/COOKIESECRET',
+    'config/ADMINPASSWORD',
+    'config/ROOTPASSWORD',
+    'config/REDISPASSWORD',
+    'config/POSTGRESPASSWORD',
+    'config/POSTGRESQLPASSWORD',
+    'config/MYSQLPASSWORD',
+    'config/MARIADBPASSWORD',
+    'config/MONGOPASSWORD',
+    'config/MONGODBPASSWORD',
+    'config/RABBITMQPASSWORD',
+    'config/ELASTICSEARCHPASSWORD',
+    'config/SMTPPASSWORD',
+    'config/TLSPRIVATEKEY',
+    'config/SSLPRIVATEKEY',
+  ])('rejects reviewed ecosystem credential compound %s', (path) => {
+    expect(() => assertArchiveEntries([entry(path)])).toThrow(/^bundle_entry_forbidden$/u);
+  });
+
+  it.each([
+    'config/JWTSECRETARY',
+    'config/ADMINPASSWORDLESS',
+    'config/TLSPRIVATEKEYBOARD',
+    'config/POSTGRESQLKEYNOTE',
+    'config/MONGODBKEYSTONE',
+  ])('admits ecosystem credential near-neighbor %s only when the full token is opaque', (path) => {
+    expect(() => assertArchiveEntries([entry(path)])).not.toThrow();
+  });
+
+  it.each([
+    'config/CONNECTIONSTRING',
+    'config/connection-string',
+    'config/DATABASEURL',
+    'config/database-url',
+    'config/CONNECTIONURI',
+    'config/connection_uri',
+    'config/DATABASEURI',
+    'config/database.uri',
+  ])('rejects exact connection-coordinate compound %s', (path) => {
+    expect(() => assertArchiveEntries([entry(path)])).toThrow(/^bundle_entry_forbidden$/u);
+  });
+
+  it.each([
+    'config/URL',
+    'config/URI',
+    'config/STRING',
+    'config/CONNECTIONSTRINGIFY',
+    'config/DATABASEURLBUILDER',
+  ])('does not treat bare connection-coordinate word or near-neighbor %s as a secret', (path) => {
+    expect(() => assertArchiveEntries([entry(path)])).not.toThrow();
+  });
+
+  it.each([
     'config/TOKENCOUNTSECRET',
     'config/TOKENBUCKETKEY',
     'config/SECRETSANTAKEYS',
@@ -439,7 +516,6 @@ describe('migration archive admission policy', () => {
     'config/.pypirc.test.tsx',
     'config/.netrc.client.js',
     'config/.git-credentials.generated.mjs',
-    'keys/id_rsa.spec.ts',
     'keys/id_ed25519.ts',
     'repo/.docker/config.json.test.ts',
     'repo/.kube/config.client.tsx',
@@ -451,11 +527,22 @@ describe('migration archive admission policy', () => {
   });
 
   it.each([
+    'config/.npmrc.test.ts',
+    'config/credentials.test.ts',
+    'keys/id_rsa.spec.ts',
+  ])('keeps exact credential dotted-prefix path %s fail-closed by design', (path) => {
+    expect(() => assertArchiveEntries([entry(path)])).toThrow(/^bundle_entry_forbidden$/u);
+  });
+
+  it.each([
     'src/.npmrc-reader.ts',
     'src/id_rsa_parser.ts',
     'src/docker-config.ts',
     'src/kube-config.ts',
     'src/hosts-yml.ts',
+    'src/npmrc-parser.test.ts',
+    'src/credentials-parser.test.ts',
+    'src/id-rsa-parser.spec.ts',
   ])('admits legitimate source near-neighbor %s of an exact credential path', (path) => {
     expect(() => assertArchiveEntries([entry(path)])).not.toThrow();
   });
@@ -496,6 +583,57 @@ describe('migration archive admission policy', () => {
     'fixtures/fixture．ＰＤＦ',
   ])('rejects canonical compatibility alias of denylisted suffix %s', (path) => {
     expect(() => assertArchiveEntries([entry(path)])).toThrow(/^bundle_entry_forbidden$/u);
+  });
+
+  it.each([
+    'public/photo.heic',
+    'public/photo.HEIF',
+    'public/vector.svgz',
+    'public/font.ttf',
+    'public/font.otf',
+    'public/font.eot',
+    'public/photo.jpe',
+    'public/photo.jfif',
+    'public/photo.jxl',
+    'public/photo.bmp',
+    'public/photo.tif',
+    'public/photo.tiff',
+    'public/photo.apng',
+    'public/video.mp4',
+    'public/video.webm',
+    'public/video.mov',
+    'public/video.m4v',
+    'public/audio.mp3',
+    'public/audio.wav',
+    'public/audio.ogg',
+    'public/audio.flac',
+    'public/photo．ＨＥＩＣ',
+    'public/video.ＭＰ４',
+  ])('rejects text-looking unsupported candidate asset suffix %s', (path) => {
+    expect(() => assertArchiveEntries([entry(path)])).toThrow(/^bundle_entry_forbidden$/u);
+  });
+
+  it.each([
+    ['public/photo.heic', [0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70, 0x68, 0x65, 0x69, 0x63]],
+    ['public/vector.svgz', [0x1f, 0x8b, 0x08, 0x00]],
+    ['public/font.ttf', [0x00, 0x01, 0x00, 0x00]],
+    ['public/font.otf', [0x4f, 0x54, 0x54, 0x4f]],
+    ['public/photo.jfif', [0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, 0x4a, 0x46, 0x49, 0x46]],
+    ['public/photo.jxl', [0x00, 0x00, 0x00, 0x0c, 0x4a, 0x58, 0x4c, 0x20, 0x0d, 0x0a, 0x87, 0x0a]],
+    ['public/photo.bmp', [0x42, 0x4d, 0x3a, 0x00]],
+    ['public/photo.tiff', [0x49, 0x49, 0x2a, 0x00]],
+    ['public/photo.apng', [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]],
+    ['public/video.mp4', [0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d]],
+    ['public/video.webm', [0x1a, 0x45, 0xdf, 0xa3]],
+    ['public/video.mov', [0x00, 0x00, 0x00, 0x14, 0x66, 0x74, 0x79, 0x70, 0x71, 0x74, 0x20, 0x20]],
+    ['public/audio.mp3', [0x49, 0x44, 0x33, 0x04]],
+    ['public/audio.wav', [0x52, 0x49, 0x46, 0x46, 0x00, 0x00, 0x00, 0x00, 0x57, 0x41, 0x56, 0x45]],
+    ['public/audio.ogg', [0x4f, 0x67, 0x67, 0x53]],
+    ['public/audio.flac', [0x66, 0x4c, 0x61, 0x43]],
+  ])('rejects representative real unsupported binary payload at %s', (path, payload) => {
+    expect(() =>
+      assertArchiveEntries([entry(path, { bytes: new Uint8Array(payload) })]),
+    ).toThrow(/^bundle_entry_forbidden$/u);
   });
 
   it('rejects generated provider state roots but admits similarly named source paths', () => {

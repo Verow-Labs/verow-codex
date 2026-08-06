@@ -198,6 +198,12 @@ const CREDENTIAL_TOKEN_PAIRS = new Set([
   'service:token',
   'service:tokens',
 ]);
+const CREDENTIAL_CONNECTION_COORDINATE_PAIRS = new Set([
+  'connection:string',
+  'connection:uri',
+  'database:uri',
+  'database:url',
+]);
 const CREDENTIAL_SENSITIVE_TOKENS = new Set([
   'credential',
   'credentials',
@@ -214,6 +220,7 @@ const CREDENTIAL_SENSITIVE_TOKENS = new Set([
 ]);
 const CREDENTIAL_COMPOUND_PREFIXES = [
   'access',
+  'admin',
   'api',
   'application',
   'auth',
@@ -223,25 +230,33 @@ const CREDENTIAL_COMPOUND_PREFIXES = [
   'azure',
   'base',
   'bearer',
+  'beta',
   'bucket',
   'certificate',
   'client',
   'cloudflare',
   'connection',
   'count',
+  'cookie',
   'database',
   'db',
   'dev',
   'development',
   'encryption',
+  'elasticsearch',
   'firebase',
   'github',
   'gitlab',
   'google',
+  'jwt',
   'keystore',
   'live',
   'local',
   'master',
+  'mariadb',
+  'mongo',
+  'mongodb',
+  'mysql',
   'netlify',
   'npm',
   'oauth',
@@ -249,24 +264,36 @@ const CREDENTIAL_COMPOUND_PREFIXES = [
   'private',
   'prod',
   'production',
+  'postgres',
+  'postgresql',
+  'rabbitmq',
+  'redis',
   'refresh',
   'release',
+  'root',
   'santa',
   'sanity',
   'sendgrid',
   'service',
   'session',
   'signing',
+  'smtp',
+  'ssl',
   'ssh',
   'stage',
   'staging',
+  'string',
   'stripe',
   'supabase',
   'test',
   'testing',
+  'tls',
   'truststore',
+  'uri',
   'user',
+  'url',
   'vercel',
+  'webhook',
 ] as const;
 const CREDENTIAL_COMPOUND_WORDS = [...new Set([
   ...CREDENTIAL_COMPOUND_PREFIXES,
@@ -288,6 +315,30 @@ const SUPPORTED_CANDIDATE_ASSET_MIMES = Object.freeze({
   woff: 'font/woff',
   woff2: 'font/woff2',
 } as const);
+const UNSUPPORTED_CANDIDATE_ASSET_SUFFIXES = new Set([
+  'apng',
+  'bmp',
+  'eot',
+  'flac',
+  'heic',
+  'heif',
+  'ico',
+  'jpe',
+  'jfif',
+  'jxl',
+  'm4v',
+  'mov',
+  'mp3',
+  'mp4',
+  'ogg',
+  'otf',
+  'svgz',
+  'tif',
+  'tiff',
+  'ttf',
+  'wav',
+  'webm',
+]);
 const PDF_PREFIX_WHITESPACE = new Set([0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x20]);
 interface BlockedFormat {
   extensions: readonly string[];
@@ -335,7 +386,7 @@ const BLOCKED_FORMATS: readonly BlockedFormat[] = [
   ] },
   { extensions: ['.pdf'], signatures: [{ offset: 0, bytes: [0x25, 0x50, 0x44, 0x46, 0x2d] }] },
 ];
-const UNSAFE_BINARY_PATTERN = /(?:\.bin|\.class|\.com|\.dll|\.dylib|\.exe|\.ico|\.msi|\.node|\.so|\.wasm)$/iu;
+const UNSAFE_BINARY_PATTERN = /(?:\.bin|\.class|\.com|\.dll|\.dylib|\.exe|\.msi|\.node|\.so|\.wasm)$/iu;
 const EXECUTABLE_EXTENSIONS = new Set(['.cjs', '.js', '.mjs', '.sh', '.ts']);
 
 export interface SupportedCandidateAssetClassification {
@@ -347,6 +398,7 @@ interface CanonicalCandidatePath {
   path: string;
   segments: readonly string[];
   basename: string;
+  suffix: string;
 }
 
 type CredentialCompoundSegmentation =
@@ -446,18 +498,20 @@ function extension(path: string): string {
 function canonicalCandidatePath(path: string): CanonicalCandidatePath {
   const canonicalPath = path.normalize('NFKC').toLowerCase();
   const segments = canonicalPath.split('/');
+  const basename = segments.at(-1) ?? '';
+  const dot = basename.lastIndexOf('.');
   return {
     path: canonicalPath,
     segments,
-    basename: segments.at(-1) ?? '',
+    basename,
+    suffix: dot < 0 ? '' : basename.slice(dot + 1),
   };
 }
 
 function classifySupportedCanonicalCandidateAsset(
   path: CanonicalCandidatePath,
 ): SupportedCandidateAssetClassification | null {
-  const dot = path.basename.lastIndexOf('.');
-  const suffix = dot < 0 ? '' : path.basename.slice(dot + 1);
+  const suffix = path.suffix;
   if (!Object.hasOwn(SUPPORTED_CANDIDATE_ASSET_MIMES, suffix)) return null;
   const supportedSuffix = suffix as keyof typeof SUPPORTED_CANDIDATE_ASSET_MIMES;
   return { suffix: supportedSuffix, mime: SUPPORTED_CANDIDATE_ASSET_MIMES[supportedSuffix] };
@@ -570,6 +624,7 @@ function hasCredentialBasename(name: string): boolean {
   if (hasUnconsumedSensitiveToken) return true;
   for (let index = 0; index + 1 < tokens.length; index += 1) {
     const pair = `${tokens[index]}:${tokens[index + 1]}`;
+    if (CREDENTIAL_CONNECTION_COORDINATE_PAIRS.has(pair)) return true;
     if (
       CREDENTIAL_TOKEN_PAIRS.has(pair) &&
       (pair === 'service:account' ||
@@ -611,6 +666,7 @@ function forbiddenName(path: string): boolean {
   const name = canonical.basename;
   if (canonical.segments.some((segment) => FORBIDDEN_SEGMENTS.has(segment))) return true;
   if (hasExactCredentialPath(canonical)) return true;
+  if (UNSUPPORTED_CANDIDATE_ASSET_SUFFIXES.has(canonical.suffix)) return true;
   if (name === '.env' || name.startsWith('.env.') || name === '.dev.vars' || name.startsWith('.dev.vars.')) return true;
   if (name.endsWith('.pem') || name.endsWith('.key') || name.endsWith('.p12') || name.endsWith('.pfx')) return true;
   if (name.endsWith('.tfstate') || name.endsWith('.tfstate.backup')) return true;
