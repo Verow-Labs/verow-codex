@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { brotliCompressSync } from 'node:zlib';
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { inventoryMigrationAssets, type AssetInput } from './asset-inventory.js';
 
@@ -9,6 +9,20 @@ const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQ
 const png2x2 = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAACXBIWXMAAAPoAAAD6AG1e1JrAAAAEUlEQVR4nGP4z8DwH4QZYAwAR8oH+WdZbrcAAAAASUVORK5CYII=', 'base64');
 const animatedGif = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAAKAAAALAAAAAABAAEAAAICRAEAIfkEAAoAAAAsAAAAAAEAAQAAAgJEAQA7', 'base64');
 const sha256 = (bytes: Uint8Array): `sha256:${string}` => `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
+
+function syntheticWoff2(options: { count: number; directory: Uint8Array; decompressed: Uint8Array; flavor?: number; totalSfntSize: number }): Buffer {
+  const body = brotliCompressSync(options.decompressed);
+  const bytes = Buffer.alloc(48 + options.directory.byteLength + body.byteLength);
+  bytes.write('wOF2', 0, 'ascii');
+  bytes.writeUInt32BE(options.flavor ?? 0x0001_0000, 4);
+  bytes.writeUInt32BE(bytes.byteLength, 8);
+  bytes.writeUInt16BE(options.count, 12);
+  bytes.writeUInt32BE(options.totalSfntSize, 16);
+  bytes.writeUInt32BE(body.byteLength, 20);
+  Buffer.from(options.directory).copy(bytes, 48);
+  body.copy(bytes, 48 + options.directory.byteLength);
+  return bytes;
+}
 
 const captureReceipt = (overrides: Record<string, unknown> = {}) => ({
   policyVersion: 'move-to-verow.capture-receipt.v1',
@@ -283,6 +297,30 @@ describe('migration asset inventory', () => {
     }
   });
 
+  it('reconciles exact WOFF2 sfnt size and rejects collections, reserved transforms, and invalid Base128 lengths', async () => {
+    const asFont = (bytes: Uint8Array, id: string): AssetInput => local({
+      classification: 'structural_git', bytes, digest: sha256(bytes),
+      reference: { id, sourcePath: `fonts/${id}.woff2` }, structuralKind: 'font',
+      fontLicense: { spdxId: 'OFL-1.1', notice: 'Synthetic WOFF2 fixture' },
+    } as never);
+    // sfnt header (12) + two table records (32) + padded table bodies (8 + 4) = 56.
+    const valid = syntheticWoff2({ count: 2, directory: Buffer.from([5, 5, 7, 4]), decompressed: Buffer.alloc(9), totalSfntSize: 56 });
+    const ready = await inventoryMigrationAssets({ assets: [asFont(valid, 'valid-two-table')] });
+    expect(ready).toMatchObject({ status: 'ready', structural: [{ mime: 'font/woff2' }], blockers: [] });
+
+    const mismatchedSize = Buffer.from(valid);
+    mismatchedSize.writeUInt32BE(4, 16);
+    const collection = syntheticWoff2({ count: 1, directory: Buffer.from([5, 4]), decompressed: Buffer.alloc(4), flavor: 0x7474_6366, totalSfntSize: 32 });
+    const reservedTransform = syntheticWoff2({ count: 1, directory: Buffer.from([0x45, 4, 4]), decompressed: Buffer.alloc(4), totalSfntSize: 32 });
+    const leadingZeroBase128 = syntheticWoff2({ count: 1, directory: Buffer.from([5, 0x80, 1]), decompressed: Buffer.alloc(1), totalSfntSize: 32 });
+    const overflowingBase128 = syntheticWoff2({ count: 1, directory: Buffer.from([5, 0x90, 0x80, 0x80, 0x80, 0]), decompressed: Buffer.alloc(1), totalSfntSize: 32 });
+    const overflowingSfntSize = syntheticWoff2({ count: 1, directory: Buffer.from([0x43, 0x8f, 0xff, 0xff, 0xff, 0x7f, 1]), decompressed: Buffer.alloc(1), totalSfntSize: 28 });
+    for (const [id, bytes] of Object.entries({ mismatchedSize, collection, reservedTransform, leadingZeroBase128, overflowingBase128, overflowingSfntSize })) {
+      const result = await inventoryMigrationAssets({ assets: [asFont(bytes, id)] });
+      expect(result.blockers, id).toEqual([{ code: 'asset_policy_blocked' }]);
+    }
+  });
+
   it('allows tightening-only positive safe integer limit overrides', async () => {
     const tightening = await inventoryMigrationAssets({ assets: [local()], limits: { maxAssets: 1, maxSingleBytes: png.byteLength, maxTotalBytes: png.byteLength, maxPixels: 1, maxDimension: 1, maxFrames: 1, maxReferences: 1, maxBlockers: 1 } });
     expect(tightening.status).toBe('ready');
@@ -378,6 +416,43 @@ describe('migration asset inventory', () => {
       ],
     });
     expect(conflictingPath.blockers).toContainEqual({ code: 'asset_authority_conflict' });
+  });
+
+  it('checks capped inventory and capture arrays before enumerating element descriptors', async () => {
+    const secret = 'sk_synthetic_inventory_descriptor_traversal';
+    const observe = async (tracked: unknown[], inventoryInput: Parameters<typeof inventoryMigrationAssets>[0], code: string): Promise<void> => {
+      const original = Object.getOwnPropertyDescriptors;
+      let enumerations = 0;
+      const spy = vi.spyOn(Object, 'getOwnPropertyDescriptors').mockImplementation(((candidate: object) => {
+        if (candidate === tracked) {
+          enumerations += 1;
+          throw new Error(secret);
+        }
+        return original(candidate);
+      }) as typeof Object.getOwnPropertyDescriptors);
+      try {
+        await expect(inventoryMigrationAssets(inventoryInput)).resolves.toMatchObject({ blockers: [{ code }] });
+      } finally {
+        spy.mockRestore();
+      }
+      expect(enumerations, code).toBe(0);
+    };
+
+    const assets = Array.from({ length: 501 }, () => ({}));
+    await observe(assets, { assets: assets as never }, 'asset_policy_blocked');
+    const symbolAssets = Array.from({ length: 501 }, () => ({}));
+    Object.defineProperty(symbolAssets, Symbol('hostile'), { value: 'private', enumerable: true });
+    await expect(inventoryMigrationAssets({ assets: symbolAssets as never })).resolves.toMatchObject({ blockers: [{ code: 'asset_policy_blocked' }] });
+    const redirects = Array.from({ length: 33 }, () => 'https://assets.example.test/redirect');
+    await observe(redirects, { assets: [{ ...local({ authority: 'hosted_source_capture' } as never), captureReceipt: captureReceipt({ redirects }) } as AssetInput] }, 'capture_receipt_invalid');
+    const resolvedAddresses = Array.from({ length: 129 }, () => ({ host: 'assets.example.test', address: '8.8.8.8', public: true }));
+    await observe(resolvedAddresses, { assets: [{ ...local({ authority: 'hosted_source_capture' } as never), captureReceipt: captureReceipt({ resolvedAddresses }) } as AssetInput] }, 'capture_receipt_invalid');
+  });
+
+  it('rejects a revoked inventory array proxy without leaking a runtime error', async () => {
+    const { proxy, revoke } = Proxy.revocable([], {});
+    revoke();
+    await expect(inventoryMigrationAssets({ assets: proxy as never })).resolves.toMatchObject({ blockers: [{ code: 'asset_input_invalid' }] });
   });
 
   it('requires bounded capture evidence to use exact canonical URLs', async () => {

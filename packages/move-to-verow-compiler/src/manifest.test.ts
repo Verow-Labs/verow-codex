@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { compileMigrationArtifacts, type CompileMigrationArtifactsInput } from './manifest.js';
 
@@ -448,6 +448,94 @@ describe('migration artifact compiler', () => {
         expect(String(error)).not.toContain(secret);
       }
     }
+  });
+
+  it('checks every capped manifest array length before enumerating its element descriptors', () => {
+    const secret = 'sk_synthetic_descriptor_traversal';
+    const observe = (tracked: unknown[], compileInput: CompileMigrationArtifactsInput, expected: string): void => {
+      const original = Object.getOwnPropertyDescriptors;
+      let enumerations = 0;
+      const spy = vi.spyOn(Object, 'getOwnPropertyDescriptors').mockImplementation(((candidate: object) => {
+        if (candidate === tracked) {
+          enumerations += 1;
+          throw new Error(secret);
+        }
+        return original(candidate);
+      }) as typeof Object.getOwnPropertyDescriptors);
+      try {
+        expect(() => compileMigrationArtifacts(compileInput)).toThrow(expected);
+      } finally {
+        spy.mockRestore();
+      }
+      expect(enumerations, expected).toBe(0);
+    };
+
+    const routes = Array.from({ length: 501 }, () => ({}));
+    observe(routes, input({ routes: routes as never }), 'manifest_route_limit_exceeded');
+    const symbolRoutes = Array.from({ length: 501 }, () => ({}));
+    Object.defineProperty(symbolRoutes, Symbol('hostile'), { value: 'private', enumerable: true });
+    expect(() => compileMigrationArtifacts(input({ routes: symbolRoutes as never }))).toThrow('manifest_route_limit_exceeded');
+    const targets = Array.from({ length: 501 }, () => ({}));
+    observe(targets, input({ extraction: { ...input().extraction, targets: targets as never } }), 'manifest_target_limit_exceeded');
+    for (const [key, maximum, expected] of [
+      ['thirdPartyBoundaries', 101, 'manifest_declaration_limit_exceeded'],
+      ['derived', 501, 'manifest_declaration_limit_exceeded'],
+      ['structural', 501, 'manifest_declaration_limit_exceeded'],
+    ] as const) {
+      const declarations = Array.from({ length: maximum }, () => ({}));
+      observe(declarations, input({ extraction: { ...input().extraction, [key]: declarations as never } }), expected);
+    }
+    const bundled = Array.from({ length: 501 }, () => ({}));
+    observe(bundled, input({ assets: { ...input().assets, bundled: bundled as never } }), 'manifest_asset_limit_exceeded');
+
+    const policyTargets = Array.from({ length: 501 }, () => ({}));
+    observe(policyTargets, input({ policy: { ...input().policy, targets: policyTargets as never } }), 'manifest_policy_invalid');
+    const collectionPolicy = Array.from({ length: 501 }, () => ({}));
+    observe(collectionPolicy, input({ policy: { ...input().policy, collectionPolicy: collectionPolicy as never } }), 'manifest_policy_invalid');
+    const actions = ['edit', 'create', 'delete', 'reorder', 'edit'];
+    observe(actions, input({ policy: { ...input().policy, targets: [{ ...input().policy.targets[0]!, actions: actions as never }] } }), 'manifest_policy_invalid');
+
+    const collectionRoot = target('page.home.cards', 'collection');
+    const requiredItemIds = Array.from({ length: 1_001 }, (_, index) => `item-${index}`);
+    observe(requiredItemIds, input({
+      extraction: { ...input().extraction, targets: [collectionRoot], values: { [`${collectionRoot.key}\u0000en\u0000`]: value(collectionRoot.key, '[]') } },
+      policy: { targets: [policyTarget(collectionRoot.key)], collectionPolicy: [{ key: collectionRoot.key, locale: 'en', variant: null, minimumItems: 0, maximumItems: 1_000, requiredItemIds }] },
+    }), 'manifest_collection_invalid');
+
+    const references = Array.from({ length: 2_001 }, () => ({}));
+    observe(references, input({ assets: {
+      status: 'ready', structural: [], external: [], blockers: [],
+      bundled: [{ digest: imageDigest, bytes: imageBytes.byteLength, bytesValue: imageBytes, mime: 'image/png', encodedWidth: 1, encodedHeight: 1, renderedWidth: 1, renderedHeight: 1, pageCount: 1, animated: false, references }] as never,
+    } }), 'manifest_asset_limit_exceeded');
+  });
+
+  it('rejects a revoked array proxy without invoking proxy traps or leaking runtime errors', () => {
+    const { proxy, revoke } = Proxy.revocable([], {});
+    revoke();
+    expect(() => compileMigrationArtifacts(input({ routes: proxy as never }))).toThrow('manifest_input_invalid');
+  });
+
+  it('caps parsed collection item arrays before enumerating their descriptors', () => {
+    const collectionRoot = target('page.home.largeCards', 'collection');
+    const serializedIds = JSON.stringify(Array.from({ length: 1_001 }, (_, index) => `item-${index}`));
+    const original = Object.getOwnPropertyDescriptors;
+    let enumerations = 0;
+    const spy = vi.spyOn(Object, 'getOwnPropertyDescriptors').mockImplementation(((candidate: object) => {
+      if (Array.isArray(candidate) && candidate.length === 1_001) {
+        enumerations += 1;
+        throw new Error('sk_synthetic_parsed_collection_traversal');
+      }
+      return original(candidate);
+    }) as typeof Object.getOwnPropertyDescriptors);
+    try {
+      expect(() => compileMigrationArtifacts(input({
+        extraction: { ...input().extraction, targets: [collectionRoot], values: { [`${collectionRoot.key}\u0000en\u0000`]: value(collectionRoot.key, serializedIds) } },
+        policy: { targets: [policyTarget(collectionRoot.key)], collectionPolicy: [{ key: collectionRoot.key, locale: 'en', variant: null, minimumItems: 0, maximumItems: 1_000, requiredItemIds: [] }] },
+      }))).toThrow('manifest_collection_invalid');
+    } finally {
+      spy.mockRestore();
+    }
+    expect(enumerations).toBe(0);
   });
 
   it('rejects forged ready-inventory zero, negative, inconsistent, and over-limit numeric metadata', () => {

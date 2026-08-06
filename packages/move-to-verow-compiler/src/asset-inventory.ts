@@ -179,15 +179,21 @@ function contentFreeResult(code: AssetInventoryBlockerCode): AssetInventoryResul
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
-  if (value === null || typeof value !== 'object' || Array.isArray(value) || nodeUtilTypes.isProxy(value) || Object.getPrototypeOf(value) !== Object.prototype || Object.getOwnPropertySymbols(value).length > 0) return false;
+  if (value === null || typeof value !== 'object' || nodeUtilTypes.isProxy(value) || Array.isArray(value) || Object.getPrototypeOf(value) !== Object.prototype || Object.getOwnPropertySymbols(value).length > 0) return false;
   return Object.values(Object.getOwnPropertyDescriptors(value)).every((descriptor) => descriptor.enumerable && descriptor.get === undefined && descriptor.set === undefined);
 }
 
+function plainArrayLength(value: unknown): number | null {
+  if (value === null || typeof value !== 'object' || nodeUtilTypes.isProxy(value) || !Array.isArray(value)) return null;
+  return value.length;
+}
+
 function isPlainArray(value: unknown): value is unknown[] {
-  if (!Array.isArray(value) || nodeUtilTypes.isProxy(value) || Object.getPrototypeOf(value) !== Array.prototype || Object.getOwnPropertySymbols(value).length > 0) return false;
+  const length = plainArrayLength(value);
+  if (length === null || Object.getPrototypeOf(value) !== Array.prototype || Object.getOwnPropertySymbols(value).length > 0) return false;
   const descriptors = Object.getOwnPropertyDescriptors(value);
   const keys = Object.keys(descriptors).filter((key) => key !== 'length');
-  return keys.length === value.length && keys.every((key) => descriptors[key]?.enumerable && descriptors[key]?.get === undefined && descriptors[key]?.set === undefined);
+  return keys.length === length && keys.every((key) => descriptors[key]?.enumerable && descriptors[key]?.get === undefined && descriptors[key]?.set === undefined);
 }
 
 function exactKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
@@ -347,14 +353,16 @@ function validCaptureReceipt(receipt: unknown, bytes: Uint8Array, digest: AssetD
   if (candidate.policyVersion !== 'move-to-verow.capture-receipt.v1' || candidate.cookiesStripped !== true || candidate.authorizationStripped !== true) return false;
   if (!Number.isSafeInteger(candidate.byteLimit) || !Number.isSafeInteger(candidate.byteCount) || (candidate.byteLimit as number) <= 0 || (candidate.byteLimit as number) > limits.maxSingleBytes) return false;
   if (candidate.byteCount !== bytes.byteLength || (candidate.byteLimit as number) < bytes.byteLength || candidate.digest !== digest || candidate.sniffedMime !== mime) return false;
-  if (!isPlainArray(candidate.redirects) || candidate.redirects.length > 32 || !candidate.redirects.every((url) => typeof url === 'string')) return false;
+  const redirectCount = plainArrayLength(candidate.redirects);
+  if (redirectCount === null || redirectCount > 32 || !isPlainArray(candidate.redirects) || !candidate.redirects.every((url) => typeof url === 'string')) return false;
   const urls = [candidate.originalUrl, ...candidate.redirects, candidate.finalUrl];
   if (!urls.every((url) => typeof url === 'string')) return false;
   const canonical = urls.map((url) => canonicalHttpsUrl(url as string));
   if (canonical.some((url, index) => url === null || url !== urls[index])) return false;
   const hosts = canonical.map((url) => new URL(url as string).hostname);
   if (!hosts.every((host) => host === hosts[0])) return false;
-  if (!isPlainArray(candidate.resolvedAddresses) || candidate.resolvedAddresses.length === 0 || candidate.resolvedAddresses.length > 128) return false;
+  const resolvedAddressCount = plainArrayLength(candidate.resolvedAddresses);
+  if (resolvedAddressCount === null || resolvedAddressCount === 0 || resolvedAddressCount > 128 || !isPlainArray(candidate.resolvedAddresses)) return false;
   const receipts = candidate.resolvedAddresses;
   if (!receipts.every((entry) => {
     if (!isRecord(entry) || !exactObjectKeys(entry, ['address', 'host', 'public'])) return false;
@@ -489,7 +497,7 @@ function validRasterContainer(bytes: Uint8Array): boolean {
 }
 
 function align4(value: number): number {
-  return (value + 3) & ~3;
+  return value + ((4 - (value % 4)) % 4);
 }
 
 function zeroPadding(buffer: Buffer, start: number, end: number): boolean {
@@ -572,10 +580,11 @@ function readUIntBase128(buffer: Buffer, start: number): { next: number; value: 
 
 function inspectWoff2(buffer: Buffer, limits: AssetInventoryLimits): boolean {
   if (buffer.length < 50 || buffer.readUInt32BE(8) !== buffer.length) return false;
+  const flavor = buffer.readUInt32BE(4);
   const count = buffer.readUInt16BE(12);
   const totalSfntSize = buffer.readUInt32BE(16);
   const totalCompressedSize = buffer.readUInt32BE(20);
-  if (buffer.readUInt32BE(4) === 0 || count < 1 || count > 64 || buffer.readUInt16BE(14) !== 0 || totalSfntSize === 0 || totalSfntSize > limits.maxFontBytes || totalCompressedSize === 0 || totalCompressedSize > limits.maxFontBytes) return false;
+  if (flavor === 0 || flavor === 0x7474_6366 || count < 1 || count > 64 || buffer.readUInt16BE(14) !== 0 || totalSfntSize === 0 || totalSfntSize > limits.maxFontBytes || totalCompressedSize === 0 || totalCompressedSize > limits.maxFontBytes) return false;
   const metaOffset = buffer.readUInt32BE(28);
   const metaLength = buffer.readUInt32BE(32);
   const metaOrigLength = buffer.readUInt32BE(36);
@@ -587,6 +596,7 @@ function inspectWoff2(buffer: Buffer, limits: AssetInventoryLimits): boolean {
   const tags = new Set<string>();
   let cursor = 48;
   let decompressedSize = 0;
+  let expectedSfntSize = 12 + count * 16;
   for (let index = 0; index < count; index += 1) {
     const flags = buffer[cursor];
     if (flags === undefined) return false;
@@ -606,8 +616,11 @@ function inspectWoff2(buffer: Buffer, limits: AssetInventoryLimits): boolean {
     const original = readUIntBase128(buffer, cursor);
     if (original === null || original.value === 0) return false;
     cursor = original.next;
+    expectedSfntSize += align4(original.value);
+    if (!Number.isSafeInteger(expectedSfntSize) || expectedSfntSize > limits.maxFontBytes) return false;
     const transformVersion = flags >>> 6;
-    const transformed = tag === 'glyf' || tag === 'loca' ? transformVersion !== 3 : transformVersion !== 0;
+    const transformed = tag === 'glyf' || tag === 'loca' ? transformVersion === 0 : tag === 'hmtx' && transformVersion === 1;
+    if ((tag === 'glyf' || tag === 'loca') ? transformVersion === 1 || transformVersion === 2 : tag === 'hmtx' ? transformVersion > 1 : transformVersion !== 0) return false;
     let storedLength = original.value;
     if (transformed) {
       const transform = readUIntBase128(buffer, cursor);
@@ -618,6 +631,7 @@ function inspectWoff2(buffer: Buffer, limits: AssetInventoryLimits): boolean {
     decompressedSize += storedLength;
     if (!Number.isSafeInteger(decompressedSize) || decompressedSize > limits.maxFontBytes) return false;
   }
+  if (expectedSfntSize !== totalSfntSize) return false;
   if (cursor > buffer.length - totalCompressedSize) return false;
   try {
     if (brotliDecompressSync(buffer.subarray(cursor, cursor + totalCompressedSize), { maxOutputLength: decompressedSize }).byteLength !== decompressedSize) return false;
@@ -700,13 +714,15 @@ function sortInput(left: AssetInput, right: AssetInput): number {
 }
 
 export async function inventoryMigrationAssets(input: AssetInventoryInput): Promise<AssetInventoryResult> {
-  if (!isRecord(input) || !exactKeys(input, input.limits === undefined ? ['assets'] : ['assets', 'limits']) || !isPlainArray(input.assets) || input.assets.some((asset) => !validAssetInput(asset))) {
+  if (!isRecord(input) || !exactKeys(input, input.limits === undefined ? ['assets'] : ['assets', 'limits'])) {
     return contentFreeResult('asset_input_invalid');
   }
   const limits = resolveLimits(input.limits);
   if (limits === null) return contentFreeResult('asset_limit_invalid');
-  if (!Array.isArray(input.assets)) return contentFreeResult('asset_input_invalid');
-  if (input.assets.length > limits.maxAssets || input.assets.length > limits.maxReferences) return contentFreeResult('asset_policy_blocked');
+  const assetCount = plainArrayLength(input.assets);
+  if (assetCount === null) return contentFreeResult('asset_input_invalid');
+  if (assetCount > limits.maxAssets || assetCount > limits.maxReferences) return contentFreeResult('asset_policy_blocked');
+  if (!isPlainArray(input.assets) || input.assets.some((asset) => !validAssetInput(asset))) return contentFreeResult('asset_input_invalid');
   let attemptedBytes = 0;
   for (const asset of input.assets) {
     if (asset.authority === 'declared_external') continue;

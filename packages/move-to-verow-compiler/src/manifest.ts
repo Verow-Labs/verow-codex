@@ -212,15 +212,21 @@ function compareIdentities(left: MigrationContentIdentity, right: MigrationConte
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
-  if (value === null || typeof value !== 'object' || Array.isArray(value) || nodeUtilTypes.isProxy(value) || Object.getPrototypeOf(value) !== Object.prototype || Object.getOwnPropertySymbols(value).length > 0) return false;
+  if (value === null || typeof value !== 'object' || nodeUtilTypes.isProxy(value) || Array.isArray(value) || Object.getPrototypeOf(value) !== Object.prototype || Object.getOwnPropertySymbols(value).length > 0) return false;
   return Object.values(Object.getOwnPropertyDescriptors(value)).every((descriptor) => descriptor.enumerable && descriptor.get === undefined && descriptor.set === undefined);
 }
 
+function plainArrayLength(value: unknown): number | null {
+  if (value === null || typeof value !== 'object' || nodeUtilTypes.isProxy(value) || !Array.isArray(value)) return null;
+  return value.length;
+}
+
 function isPlainArray(value: unknown): value is unknown[] {
-  if (!Array.isArray(value) || nodeUtilTypes.isProxy(value) || Object.getPrototypeOf(value) !== Array.prototype || Object.getOwnPropertySymbols(value).length > 0) return false;
+  const length = plainArrayLength(value);
+  if (length === null || Object.getPrototypeOf(value) !== Array.prototype || Object.getOwnPropertySymbols(value).length > 0) return false;
   const descriptors = Object.getOwnPropertyDescriptors(value);
   const keys = Object.keys(descriptors).filter((key) => key !== 'length');
-  return keys.length === value.length && keys.every((key) => descriptors[key]?.get === undefined && descriptors[key]?.set === undefined);
+  return keys.length === length && keys.every((key) => descriptors[key]?.get === undefined && descriptors[key]?.set === undefined);
 }
 
 function exactKeys(value: object, expected: readonly string[]): boolean {
@@ -321,16 +327,23 @@ function canonicalPublicHttpsUrl(raw: unknown): string | null {
 function validateRoot(input: CompileMigrationArtifactsInput): void {
   if (!isRecord(input) || !exactKeys(input, INPUT_KEYS) || !UUID_PATTERN.test(input.websiteId) || !UUID_PATTERN.test(input.migrationId) ||
       !validDigest(input.sourceDigest) || !validDigest(input.candidateDigest) || !validProtocol(input.cmsNativeProtocol)) fail('manifest_input_invalid');
-  if (!isPlainArray(input.routes) || !isRecord(input.extraction) || !isRecord(input.assets) || !isRecord(input.policy)) fail('manifest_input_invalid');
-  if (!exactKeys(input.extraction, EXTRACTION_KEYS) || !isPlainArray(input.extraction.targets) || !isRecord(input.extraction.values) ||
-      !isPlainArray(input.extraction.structuredFamilies) || !isPlainArray(input.extraction.thirdPartyBoundaries) ||
-      !isPlainArray(input.extraction.derived) || !isPlainArray(input.extraction.structural) || !isPlainArray(input.extraction.needsAttention)) fail('manifest_input_invalid');
-  if (!exactKeys(input.assets, ASSET_INVENTORY_KEYS) || !isPlainArray(input.assets.bundled) || !isPlainArray(input.assets.structural) ||
-      !isPlainArray(input.assets.external) || !isPlainArray(input.assets.blockers)) fail('manifest_input_invalid');
-  if (input.routes.length > MAX_ROUTES) fail('manifest_route_limit_exceeded');
-  if (input.extraction.thirdPartyBoundaries.length > MAX_THIRD_PARTY_BOUNDARIES || input.extraction.derived.length > MAX_PRIVATE_DECLARATIONS ||
-      input.extraction.structural.length > MAX_PRIVATE_DECLARATIONS) fail('manifest_declaration_limit_exceeded');
-  if (input.assets.bundled.length + input.assets.structural.length + input.assets.external.length > MAX_ASSET_RECORDS) fail('manifest_asset_limit_exceeded');
+  if (!isRecord(input.extraction) || !isRecord(input.assets) || !isRecord(input.policy) || !exactKeys(input.extraction, EXTRACTION_KEYS) ||
+      !isRecord(input.extraction.values) || !exactKeys(input.assets, ASSET_INVENTORY_KEYS)) fail('manifest_input_invalid');
+  const lengths = {
+    routes: plainArrayLength(input.routes), targets: plainArrayLength(input.extraction.targets), structuredFamilies: plainArrayLength(input.extraction.structuredFamilies),
+    thirdPartyBoundaries: plainArrayLength(input.extraction.thirdPartyBoundaries), derived: plainArrayLength(input.extraction.derived), structural: plainArrayLength(input.extraction.structural),
+    needsAttention: plainArrayLength(input.extraction.needsAttention), bundled: plainArrayLength(input.assets.bundled), structuralAssets: plainArrayLength(input.assets.structural),
+    external: plainArrayLength(input.assets.external), blockers: plainArrayLength(input.assets.blockers),
+  };
+  if (Object.values(lengths).some((length) => length === null)) fail('manifest_input_invalid');
+  if ((lengths.routes as number) > MAX_ROUTES) fail('manifest_route_limit_exceeded');
+  if ((lengths.targets as number) > MAX_TARGETS) fail('manifest_target_limit_exceeded');
+  if ((lengths.thirdPartyBoundaries as number) > MAX_THIRD_PARTY_BOUNDARIES || (lengths.derived as number) > MAX_PRIVATE_DECLARATIONS ||
+      (lengths.structural as number) > MAX_PRIVATE_DECLARATIONS) fail('manifest_declaration_limit_exceeded');
+  if ((lengths.bundled as number) + (lengths.structuralAssets as number) + (lengths.external as number) > MAX_ASSET_RECORDS) fail('manifest_asset_limit_exceeded');
+  if ((lengths.structuredFamilies as number) > STRUCTURED_FAMILIES.size || (lengths.needsAttention as number) > MAX_TARGETS || (lengths.blockers as number) > MAX_ASSET_RECORDS) fail('manifest_input_invalid');
+  if (![input.routes, input.extraction.targets, input.extraction.structuredFamilies, input.extraction.thirdPartyBoundaries, input.extraction.derived,
+    input.extraction.structural, input.extraction.needsAttention, input.assets.bundled, input.assets.structural, input.assets.external, input.assets.blockers].every(isPlainArray)) fail('manifest_input_invalid');
 }
 
 function routeMap(input: CompileMigrationArtifactsInput): Map<string, MigrationRouteV1> {
@@ -356,7 +369,7 @@ function validateCandidate(target: EditableContentCandidate, routes: ReadonlyMap
 
 function extractionIdentities(input: CompileMigrationArtifactsInput, routes: ReadonlyMap<string, MigrationRouteV1>): Map<string, EditableContentCandidate> {
   if (input.extraction.status !== 'ready' || input.extraction.needsAttention.length > 0) fail('manifest_extraction_blocked');
-  if (!isPlainArray(input.extraction.targets) || input.extraction.targets.length > MAX_TARGETS || !isRecord(input.extraction.values)) fail(input.extraction.targets.length > MAX_TARGETS ? 'manifest_target_limit_exceeded' : 'manifest_input_invalid');
+  if (!isPlainArray(input.extraction.targets) || !isRecord(input.extraction.values)) fail('manifest_input_invalid');
   const targets = new Map<string, EditableContentCandidate>();
   for (const target of input.extraction.targets) {
     validateCandidate(target, routes);
@@ -374,12 +387,17 @@ function extractionIdentities(input: CompileMigrationArtifactsInput, routes: Rea
 }
 
 function policyMap(input: CompileMigrationArtifactsInput, targets: ReadonlyMap<string, EditableContentCandidate>): Map<string, MigrationTargetPolicyV1> {
-  if (!isRecord(input.policy) || !exactKeys(input.policy, ['collectionPolicy', 'targets']) || !isPlainArray(input.policy.targets) || !isPlainArray(input.policy.collectionPolicy)) fail('manifest_policy_invalid');
+  if (!isRecord(input.policy) || !exactKeys(input.policy, ['collectionPolicy', 'targets'])) fail('manifest_policy_invalid');
+  const targetPolicyLength = plainArrayLength(input.policy.targets);
+  const collectionPolicyLength = plainArrayLength(input.policy.collectionPolicy);
+  if (targetPolicyLength === null || collectionPolicyLength === null || targetPolicyLength > MAX_TARGETS || collectionPolicyLength > MAX_TARGETS) fail('manifest_policy_invalid');
+  if (!isPlainArray(input.policy.targets) || !isPlainArray(input.policy.collectionPolicy)) fail('manifest_policy_invalid');
   const policies = new Map<string, MigrationTargetPolicyV1>();
   for (const policy of input.policy.targets) {
+    const actionLength = isRecord(policy) ? plainArrayLength(policy.actions) : null;
     if (!isRecord(policy) || !exactKeys(policy, ['actions', 'cardinality', 'collection', 'imagePair', 'key', 'liveVerification', 'locale', 'required', 'variant']) || !validIdentity(policy) ||
         typeof policy.required !== 'boolean' || !['one', 'many'].includes(policy.cardinality) || !['route', 'global', 'none'].includes(policy.liveVerification) || policy.collection !== null ||
-        !isPlainArray(policy.actions) || policy.actions.length === 0 || policy.actions.some((action) => !ACTIONS.has(action as MigrationActionV1)) || new Set(policy.actions).size !== policy.actions.length) fail('manifest_policy_invalid');
+        actionLength === null || actionLength === 0 || actionLength > ACTIONS.size || !isPlainArray(policy.actions) || policy.actions.some((action) => !ACTIONS.has(action as MigrationActionV1)) || new Set(policy.actions).size !== policy.actions.length) fail('manifest_policy_invalid');
     if (policy.imagePair !== null && (!isRecord(policy.imagePair) || !exactKeys(policy.imagePair, ['role', 'target']) || !['image', 'alt'].includes(policy.imagePair.role) || !validIdentity(policy.imagePair.target))) fail('manifest_policy_invalid');
     const id = identityKey(policy);
     if (policies.has(id)) fail('manifest_policy_bijection');
@@ -397,9 +415,10 @@ function collectionDetails(input: CompileMigrationArtifactsInput, targets: Reado
   const roots = [...targets.values()].filter(({ valueType }) => valueType === 'collection');
   const policies = new Map<string, CollectionPolicyV1>();
   for (const policy of input.policy.collectionPolicy) {
+    const requiredItemCount = isRecord(policy) ? plainArrayLength(policy.requiredItemIds) : null;
     if (!isRecord(policy) || !exactKeys(policy, ['key', 'locale', 'maximumItems', 'minimumItems', 'requiredItemIds', 'variant']) || !validIdentity(policy) ||
         !Number.isSafeInteger(policy.minimumItems) || !Number.isSafeInteger(policy.maximumItems) || policy.minimumItems < 0 || policy.maximumItems < policy.minimumItems || policy.maximumItems > MAX_COLLECTION_ITEMS ||
-        !isPlainArray(policy.requiredItemIds) || policy.requiredItemIds.length > MAX_COLLECTION_ITEMS || policy.requiredItemIds.some((id) => !safeString(id, 200)) || new Set(policy.requiredItemIds).size !== policy.requiredItemIds.length) fail('manifest_collection_invalid');
+        requiredItemCount === null || requiredItemCount > MAX_COLLECTION_ITEMS || !isPlainArray(policy.requiredItemIds) || policy.requiredItemIds.some((id) => !safeString(id, 200)) || new Set(policy.requiredItemIds).size !== policy.requiredItemIds.length) fail('manifest_collection_invalid');
     const id = identityKey(policy);
     if (policies.has(id)) fail('manifest_collection_invalid');
     policies.set(id, policy);
@@ -416,10 +435,12 @@ function collectionDetails(input: CompileMigrationArtifactsInput, targets: Reado
     const rawValue = input.extraction.values[id]?.value;
     let stableIds: unknown;
     try { stableIds = JSON.parse(rawValue ?? ''); } catch { fail('manifest_collection_invalid'); }
+    const stableIdCount = plainArrayLength(stableIds);
+    if (stableIdCount === null || stableIdCount > MAX_COLLECTION_ITEMS || stableIdCount < policy.minimumItems || stableIdCount > policy.maximumItems) fail('manifest_collection_invalid');
     if (!isPlainArray(stableIds) || stableIds.some((item) => !safeString(item, 200)) || new Set(stableIds).size !== stableIds.length) fail('manifest_collection_invalid');
     const rawIds = stableIds as string[];
     if (rawIds.some((item, index) => index > 0 && compareStrings(rawIds[index - 1] as string, item) >= 0)) fail('manifest_collection_invalid');
-    if (rawIds.length < policy.minimumItems || rawIds.length > policy.maximumItems || policy.requiredItemIds.some((required) => !rawIds.includes(required))) fail('manifest_collection_invalid');
+    if (policy.requiredItemIds.some((required) => !rawIds.includes(required))) fail('manifest_collection_invalid');
     const normalizedIds = new Map<string, string>();
     try {
       for (const rawId of rawIds) {
@@ -507,13 +528,18 @@ function validateReadyAssetInventory(input: CompileMigrationArtifactsInput): voi
   let totalBytes = 0;
   let totalReferences = 0;
   for (const asset of [...input.assets.bundled, ...input.assets.structural]) {
-    if (!isRecord(asset) || !Number.isSafeInteger(asset.bytes) || (asset.bytes as number) <= 0 || (asset.bytes as number) > MAX_SINGLE_ASSET_BYTES || !isPlainArray(asset.references)) fail('manifest_input_invalid');
+    if (!isRecord(asset) || !Number.isSafeInteger(asset.bytes) || (asset.bytes as number) <= 0 || (asset.bytes as number) > MAX_SINGLE_ASSET_BYTES) fail('manifest_input_invalid');
+    const referenceCount = plainArrayLength(asset.references);
+    if (referenceCount === null) fail('manifest_input_invalid');
     totalBytes += asset.bytes as number;
-    totalReferences += asset.references.length;
+    totalReferences += referenceCount;
     if (!Number.isSafeInteger(totalBytes) || totalBytes > MAX_TOTAL_ASSET_BYTES || totalReferences > MAX_ASSET_REFERENCES) fail('manifest_asset_limit_exceeded');
   }
   totalReferences += input.assets.external.length;
   if (totalReferences > MAX_ASSET_REFERENCES) fail('manifest_asset_limit_exceeded');
+  for (const asset of [...input.assets.bundled, ...input.assets.structural]) {
+    if (!isPlainArray(asset.references)) fail('manifest_input_invalid');
+  }
   if (input.assets.bundled.some((asset) => !validInventoriedAsset(asset, 'editorial_cms')) ||
       input.assets.structural.some((asset) => !validInventoriedAsset(asset, 'structural_git'))) fail('manifest_input_invalid');
   for (const asset of input.assets.external) {
