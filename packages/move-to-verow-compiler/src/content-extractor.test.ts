@@ -7,7 +7,9 @@ import {
   extractManagedContent,
   type AuthorizedContentSource,
   type ContentCandidate,
+  type ContentExtractionResult,
   type ContentExtractionInput,
+  type EditableContentCandidate,
 } from './content-extractor.js';
 
 const fixtureRoot = resolve(import.meta.dirname, '..', 'fixtures', 'sites-content-surfaces');
@@ -73,6 +75,57 @@ describe('managed content extraction', () => {
   it('encodes editable ownership as a discriminated union', () => {
     expectTypeOf<Extract<ContentCandidate, { owner: 'site_region' }>['structuredFamily']>().toEqualTypeOf<null>();
     expectTypeOf<Extract<ContentCandidate, { owner: 'structured_family' }>['structuredFamily']>().toEqualTypeOf<'blog' | 'event' | 'social' | 'menu' | 'faq'>();
+    expectTypeOf<ContentExtractionResult['targets'][number]>().toEqualTypeOf<EditableContentCandidate>();
+    expectTypeOf<Extract<EditableContentCandidate, { owner: 'derived' }>>().toEqualTypeOf<never>();
+    expectTypeOf<Extract<EditableContentCandidate, { owner: 'structural_code' }>>().toEqualTypeOf<never>();
+  });
+
+  it('owns metadata, submit labels, ARIA value text, and unary numeric JSX exactly once', () => {
+    const sources = [source('app/page.tsx', `export default () => <>
+      <meta name="description" content="Synthetic metadata description" />
+      <meta property="og:title" content="Synthetic Open Graph title" />
+      <form id="inquiry" action="/api/inquiry"><input type="submit" value="Synthetic inquiry action" /></form>
+      <input data-verow-role="completion" aria-valuetext="Synthetic half complete" />
+      <span data-verow-role="change">{-5}</span>
+    </>;`)];
+    const result = extractManagedContent(inputFor(sources));
+    const targetByKey = new Map(result.targets.map((target) => [target.key, target]));
+
+    expect(result.status).toBe('ready');
+    expect(targetByKey.get('page.home.metadata.description')).toMatchObject({ sourceKind: 'metadata', owner: 'site_region' });
+    expect(targetByKey.get('page.home.metadata.openGraph.title')).toMatchObject({ sourceKind: 'metadata', owner: 'site_region' });
+    expect(targetByKey.get('page.home.inquiry.submitLabel')).toMatchObject({ sourceKind: 'jsx', valueType: 'string' });
+    expect(targetByKey.get('page.home.completion.ariaValueText')).toMatchObject({ sourceKind: 'aria' });
+    expect(targetByKey.get('page.home.change.text')).toMatchObject({ sourceKind: 'jsx' });
+    expect(result.values['page.home.change.text\u0000en\u0000']?.value).toBe('-5');
+    for (const key of [
+      'page.home.metadata.description',
+      'page.home.metadata.openGraph.title',
+      'page.home.inquiry.submitLabel',
+      'page.home.completion.ariaValueText',
+      'page.home.change.text',
+    ]) {
+      expect(result.targets.filter((target) => target.key === key)).toHaveLength(1);
+    }
+    expect(result.targets.some(({ key }) => key.endsWith('.action'))).toBe(false);
+    expect(result.targets.every(({ owner }) => owner === 'site_region' || owner === 'structured_family')).toBe(true);
+  });
+
+  it('blocks potentially human-facing unknown JSX attributes and expressions content-free', () => {
+    const cases = [
+      '<div mysteryCopy="Synthetic unknown copy" />',
+      '<Panel marketingCopy={getCopy()} />',
+      '<TeamMember name="Synthetic customer name" />',
+      '<Panel action="Synthetic CTA wording" />',
+      '<meta name="custom-copy" content={getCopy()} />',
+    ];
+    for (const jsx of cases) {
+      const result = extractManagedContent(inputFor([source('app/page.tsx', `export default () => ${jsx};`)]));
+      expect(result.status).toBe('needs_attention');
+      expect(result.needsAttention.map(({ code }) => code)).toEqual(expect.arrayContaining(['ambiguous_owner']));
+      expect(JSON.stringify(result.needsAttention)).not.toContain('Synthetic unknown copy');
+      expect(JSON.stringify(result.needsAttention)).not.toContain('getCopy');
+    }
   });
   it('owns every representative source surface exactly once', async () => {
     const result = await extractFixture();
@@ -187,6 +240,15 @@ describe('managed content extraction', () => {
       'page.home.inquiry.helpText',
       'page.home.inquiry.successMessage',
       'page.home.inquiry.validationMessage',
+    ]));
+
+    const customLink = extractManagedContent(inputFor([
+      source('app/page.tsx', 'export default () => <Link href="/about" aria-label="Synthetic about link" />;'),
+    ]));
+    expect(customLink.status).toBe('ready');
+    expect(customLink.targets.map(({ key }) => key)).toEqual(expect.arrayContaining([
+      'page.home.link.href',
+      'page.home.link.ariaLabel',
     ]));
 
     for (const text of [

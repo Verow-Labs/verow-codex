@@ -51,12 +51,15 @@ interface ContentCandidateBase {
   thirdPartyBoundary: string | null;
 }
 
-export type ContentCandidate = ContentCandidateBase & (
+export type EditableContentCandidate = ContentCandidateBase & (
   | { owner: 'site_region'; structuredFamily: null }
   | { owner: 'structured_family'; structuredFamily: StructuredFamily }
-  | { owner: 'derived'; structuredFamily: null }
-  | { owner: 'structural_code'; structuredFamily: null }
 );
+
+export type ContentCandidate =
+  | EditableContentCandidate
+  | (ContentCandidateBase & { owner: 'derived'; structuredFamily: null })
+  | (ContentCandidateBase & { owner: 'structural_code'; structuredFamily: null });
 
 export interface AuthorizedContentSource {
   path: string;
@@ -169,7 +172,7 @@ export interface StructuralContentCandidate {
 
 export interface ContentExtractionResult {
   status: 'ready' | 'needs_attention';
-  targets: readonly ContentCandidate[];
+  targets: readonly EditableContentCandidate[];
   values: Readonly<Record<string, ManagedContentValue>>;
   structuredFamilies: readonly StructuredFamily[];
   thirdPartyBoundaries: readonly ThirdPartyBoundary[];
@@ -228,7 +231,7 @@ interface Evaluated {
 }
 
 interface TargetDraft {
-  target: ContentCandidate;
+  target: EditableContentCandidate;
   value: string;
   rawIdentity: string;
 }
@@ -475,11 +478,12 @@ function hasDirectStaticJsxText(node: ts.JsxElement): boolean {
 
 function humanAttributeField(tagName: string, attributeName: string): string | null {
   const tag = tagName.toLowerCase();
-  if (['script', 'style', 'link', 'meta'].includes(tag)) return null;
+  if (['script', 'style', 'link', 'meta'].includes(tagName)) return null;
   const custom = /^\p{Lu}/u.test(tagName);
   const names: Readonly<Record<string, string>> = {
     'aria-description': 'ariaDescription',
     'aria-label': 'ariaLabel',
+    'aria-valuetext': 'ariaValueText',
     alt: 'alt',
     caption: 'caption',
     errorMessage: 'errorMessage',
@@ -500,6 +504,102 @@ function humanAttributeField(tagName: string, attributeName: string): string | n
   if (attributeName === 'placeholder' && !custom && !['input', 'textarea'].includes(tag)) return null;
   if (/^(?:errorMessage|helpText|label|successMessage|validationMessage)$/u.test(attributeName) && !custom) return null;
   return field;
+}
+
+const universalTechnicalJsxAttributes = new Set([
+  'aria-hidden',
+  'class',
+  'className',
+  'data-verow-boundary',
+  'data-verow-derived-from',
+  'data-verow-field',
+  'data-verow-integration',
+  'data-verow-provider',
+  'data-verow-role',
+  'id',
+  'key',
+  'ref',
+  'role',
+  'style',
+]);
+
+const intrinsicTechnicalJsxAttributes = new Set([
+  'accept',
+  'autoComplete',
+  'autoFocus',
+  'charSet',
+  'checked',
+  'cols',
+  'decoding',
+  'disabled',
+  'fetchPriority',
+  'height',
+  'httpEquiv',
+  'loading',
+  'method',
+  'multiple',
+  'readOnly',
+  'rel',
+  'required',
+  'rows',
+  'tabIndex',
+  'target',
+  'type',
+  'width',
+]);
+
+const namedIntrinsicTags = new Set([
+  'button',
+  'fieldset',
+  'form',
+  'iframe',
+  'input',
+  'map',
+  'meta',
+  'object',
+  'output',
+  'param',
+  'select',
+  'textarea',
+]);
+
+function isTechnicalJsxAttribute(tagName: string, attributeName: string): boolean {
+  if (universalTechnicalJsxAttributes.has(attributeName) || /^on\p{Lu}/u.test(attributeName)) return true;
+  const tag = tagName.toLowerCase();
+  if (tagName !== tag) return false;
+  if (attributeName === 'action') return tag === 'form';
+  if (attributeName === 'formAction') return tag === 'button' || tag === 'input';
+  if (attributeName === 'name') return namedIntrinsicTags.has(tag);
+  if (attributeName === 'property') return tag === 'meta';
+  return intrinsicTechnicalJsxAttributes.has(attributeName);
+}
+
+interface MetadataAddress {
+  roles: readonly string[];
+  field: string;
+}
+
+const technicalMetadataNames = new Set([
+  'color-scheme',
+  'generator',
+  'referrer',
+  'robots',
+  'theme-color',
+  'viewport',
+]);
+
+function metadataAddress(attributes: ts.JsxAttributes): MetadataAddress | null {
+  const name = extractAttributeLiteral(attributes, 'name')?.toLowerCase();
+  if (name === 'description') return { roles: ['metadata'], field: 'description' };
+
+  const property = extractAttributeLiteral(attributes, 'property')?.toLowerCase();
+  if (property === 'og:title') return { roles: ['metadata', 'openGraph'], field: 'title' };
+  return null;
+}
+
+function isTechnicalMetadata(attributes: ts.JsxAttributes): boolean {
+  const name = extractAttributeLiteral(attributes, 'name')?.toLowerCase();
+  return !!name && technicalMetadataNames.has(name);
 }
 
 function jsonHasDuplicateObjectKeys(text: string): boolean {
@@ -1068,6 +1168,53 @@ export function extractManagedContent(input: ContentExtractionInput): ContentExt
     addBlocker(failure, context.source.path, anchor(node));
   }
 
+  function addJsxAttributeTarget(
+    context: SourceContext,
+    attribute: ts.JsxAttribute,
+    roles: readonly string[],
+    field: string,
+    sourceKind: ManagedContentSourceKind,
+  ): void {
+    if (!attribute.initializer) return;
+    if (ts.isStringLiteral(attribute.initializer)) {
+      addTarget(context, roles, field, attribute.initializer.text, sourceKind, anchor(attribute), null);
+      return;
+    }
+    if (!ts.isJsxExpression(attribute.initializer) || !attribute.initializer.expression) return;
+    const expression = unwrapExpression(attribute.initializer.expression);
+    const result = evaluate(expression, context);
+    if (result.failure) {
+      addEvaluationFailure(context, expression, result.failure);
+    } else if (
+      (typeof result.value === 'string' || typeof result.value === 'number') &&
+      (
+        ts.isIdentifier(expression) ||
+        ts.isStringLiteralLike(expression) ||
+        ts.isNumericLiteral(expression) ||
+        ts.isPrefixUnaryExpression(expression)
+      )
+    ) {
+      addTarget(
+        context,
+        roles,
+        field,
+        typeof result.value === 'number' ? JSON.stringify(result.value) : result.value,
+        sourceKind,
+        anchor(attribute),
+        null,
+      );
+    } else if (
+      (typeof result.value === 'string' || typeof result.value === 'number') &&
+      ts.isPropertyAccessExpression(expression)
+    ) {
+      if (!staticPropertyAccessIsOwned(expression, context)) {
+        addBlocker('ambiguous_owner', context.source.path, anchor(attribute));
+      }
+    } else if (result.value !== null && typeof result.value !== 'boolean') {
+      addBlocker('ambiguous_owner', context.source.path, anchor(attribute));
+    }
+  }
+
   for (const context of contexts.values()) {
     for (const statement of context.sourceFile.statements) {
       if (!ts.isVariableStatement(statement)) continue;
@@ -1141,38 +1288,56 @@ export function extractManagedContent(input: ContentExtractionInput): ContentExt
           }
         }
 
+        const metadata = tag === 'meta' ? metadataAddress(attributes) : null;
+        const metadataContent = attributes.properties.find((attribute): attribute is ts.JsxAttribute => (
+          ts.isJsxAttribute(attribute) &&
+          ts.isIdentifier(attribute.name) &&
+          attribute.name.text === 'content'
+        ));
+        if (metadata && metadataContent) {
+          addJsxAttributeTarget(context, metadataContent, metadata.roles, metadata.field, 'metadata');
+        } else if (
+          tag === 'meta' &&
+          metadataContent?.initializer &&
+          !isTechnicalMetadata(attributes)
+        ) {
+          addBlocker('ambiguous_owner', context.source.path, anchor(metadataContent));
+        }
+
         for (const attribute of attributes.properties) {
           if (ts.isJsxSpreadAttribute(attribute)) {
             addBlocker('dynamic_human_value', context.source.path, anchor(attribute));
             continue;
           }
           if (!ts.isJsxAttribute(attribute) || !ts.isIdentifier(attribute.name)) continue;
-          const field = humanAttributeField(tag, attribute.name.text);
-          if (!field || !attribute.initializer) continue;
-          if (field === 'src' && ariaHidden === 'true') continue;
-          const sourceKind: ManagedContentSourceKind = field.startsWith('aria') ? 'aria' : 'jsx';
-          if (ts.isStringLiteral(attribute.initializer)) {
-            addTarget(context, [role], field, attribute.initializer.text, sourceKind, anchor(attribute), null);
+          const attributeName = attribute.name.text;
+          if (['script', 'style', 'link'].includes(tag)) continue;
+          if (tag === 'meta' && attributeName === 'content') continue;
+          const inputType = tag === 'input'
+            ? extractAttributeLiteral(attributes, 'type')?.toLowerCase()
+            : null;
+          const inputValueField = attributeName === 'value'
+            ? ({ submit: 'submitLabel', button: 'buttonLabel', reset: 'resetLabel' } as const)[inputType as 'submit' | 'button' | 'reset']
+            : undefined;
+          const field = inputValueField ?? humanAttributeField(tag, attributeName);
+          if (!field) {
+            if (!attribute.initializer || isTechnicalJsxAttribute(tag, attributeName)) continue;
+            if (ts.isStringLiteral(attribute.initializer)) {
+              addBlocker('ambiguous_owner', context.source.path, anchor(attribute));
+              continue;
+            }
+            if (ts.isJsxExpression(attribute.initializer) && attribute.initializer.expression) {
+              const result = evaluate(attribute.initializer.expression, context);
+              if (result.failure || (result.value !== null && typeof result.value !== 'boolean')) {
+                addBlocker('ambiguous_owner', context.source.path, anchor(attribute));
+              }
+            }
             continue;
           }
-          if (ts.isJsxExpression(attribute.initializer) && attribute.initializer.expression) {
-            const expression = unwrapExpression(attribute.initializer.expression);
-            const result = evaluate(expression, context);
-            if (result.failure) {
-              addEvaluationFailure(context, expression, result.failure);
-            } else if (
-              (typeof result.value === 'string' || typeof result.value === 'number') &&
-              (ts.isIdentifier(expression) || ts.isStringLiteralLike(expression) || ts.isNumericLiteral(expression))
-            ) {
-              addTarget(context, [role], field, typeof result.value === 'number' ? JSON.stringify(result.value) : result.value, sourceKind, anchor(attribute), null);
-            } else if (
-              (typeof result.value === 'string' || typeof result.value === 'number') &&
-              ts.isPropertyAccessExpression(expression) &&
-              !staticPropertyAccessIsOwned(expression, context)
-            ) {
-              addBlocker('ambiguous_owner', context.source.path, anchor(attribute));
-            }
-          }
+          if (!attribute.initializer) continue;
+          if (field === 'src' && ariaHidden === 'true') continue;
+          const sourceKind: ManagedContentSourceKind = field.startsWith('aria') ? 'aria' : 'jsx';
+          addJsxAttributeTarget(context, attribute, [role], field, sourceKind);
         }
 
         const explicitField = extractAttributeLiteral(attributes, 'data-verow-field');
@@ -1246,7 +1411,12 @@ export function extractManagedContent(input: ContentExtractionInput): ContentExt
           else if (
             (typeof result.value === 'string' || typeof result.value === 'number') &&
             parentElement &&
-            (ts.isStringLiteralLike(unwrapExpression(node.expression)) || ts.isIdentifier(unwrapExpression(node.expression)))
+            (
+              ts.isStringLiteralLike(unwrapExpression(node.expression)) ||
+              ts.isIdentifier(unwrapExpression(node.expression)) ||
+              ts.isNumericLiteral(unwrapExpression(node.expression)) ||
+              ts.isPrefixUnaryExpression(unwrapExpression(node.expression))
+            )
           ) {
             const role = jsxRole(parentElement);
             const field = extractAttributeLiteral(parentElement.openingElement.attributes, 'data-verow-field') ?? ordinaryJsxField(parentElement.openingElement.tagName.getText());
@@ -1255,6 +1425,14 @@ export function extractManagedContent(input: ContentExtractionInput): ContentExt
             (typeof result.value === 'string' || typeof result.value === 'number') &&
             ts.isPropertyAccessExpression(unwrapExpression(node.expression)) &&
             !staticPropertyAccessIsOwned(unwrapExpression(node.expression) as ts.PropertyAccessExpression, context)
+          ) {
+            addBlocker('ambiguous_owner', context.source.path, anchor(node));
+          } else if (
+            parentElement &&
+            result.value !== null &&
+            typeof result.value !== 'boolean' &&
+            typeof result.value !== 'string' &&
+            typeof result.value !== 'number'
           ) {
             addBlocker('ambiguous_owner', context.source.path, anchor(node));
           }

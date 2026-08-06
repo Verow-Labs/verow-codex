@@ -40,6 +40,7 @@ export {
   extractManagedContent,
   type AuthorizedContentSource,
   type ContentCandidate,
+  type EditableContentCandidate,
   type ContentExtractionBlocker,
   type ContentExtractionBlockerCode,
   type ContentExtractionInput,
