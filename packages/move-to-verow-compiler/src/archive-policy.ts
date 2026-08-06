@@ -47,12 +47,16 @@ const FORBIDDEN_SEGMENTS = new Set([
   '.history',
   '.local-history',
   '.move-to-verow',
+  '.netlify',
   '.next',
   '.npm',
   '.parcel-cache',
   '.pnpm-store',
+  '.firebase',
+  '.amplify',
   '.sanity',
   '.ssh',
+  '.sst',
   '.superpowers',
   '.turbo',
   '.vercel',
@@ -108,24 +112,62 @@ const CREDENTIAL_SINGLETON_TOKENS = new Set([
   'secret',
   'secrets',
   'token',
-]);
-const CREDENTIAL_ANYWHERE_TOKENS = new Set([
-  'credential',
-  'credentials',
-  'secret',
-  'secrets',
-  'token',
+  'tokens',
 ]);
 const CREDENTIAL_TOKEN_PAIRS = new Set([
+  'access:credential',
+  'access:credentials',
   'access:key',
+  'access:secret',
+  'access:secrets',
   'access:token',
   'access:tokens',
+  'api:credential',
+  'api:credentials',
   'api:key',
+  'api:secret',
+  'api:secrets',
+  'api:token',
+  'api:tokens',
+  'client:credential',
+  'client:credentials',
+  'client:key',
   'client:secret',
+  'client:secrets',
+  'client:token',
+  'client:tokens',
+  'private:credential',
+  'private:credentials',
   'private:key',
+  'private:secret',
+  'private:secrets',
+  'private:token',
+  'private:tokens',
   'refresh:token',
   'refresh:tokens',
   'service:account',
+  'service:credential',
+  'service:credentials',
+  'service:key',
+  'service:secret',
+  'service:secrets',
+  'service:token',
+  'service:tokens',
+]);
+const CREDENTIAL_PROVIDER_TOKENS = new Set([
+  'aws',
+  'azure',
+  'cloudflare',
+  'firebase',
+  'github',
+  'gitlab',
+  'google',
+  'netlify',
+  'openai',
+  'sendgrid',
+  'stripe',
+  'supabase',
+  'vercel',
 ]);
 const PDF_PREFIX_WHITESPACE = new Set([0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x20]);
 interface BlockedFormat {
@@ -266,13 +308,13 @@ function hasPathSuffix(path: string, suffix: string): boolean {
 }
 
 function credentialBasenameTokens(name: string): { extension: string; tokens: string[] } {
-  const dot = name.lastIndexOf('.');
-  const extension = dot > 0 ? name.slice(dot + 1).toLowerCase() : '';
-  const stem = dot > 0 ? name.slice(0, dot) : name;
+  const compatibilityName = name.normalize('NFKC');
+  const dot = compatibilityName.lastIndexOf('.');
+  const extension = dot > 0 ? compatibilityName.slice(dot + 1).toLowerCase() : '';
+  const stem = dot > 0 ? compatibilityName.slice(0, dot) : compatibilityName;
   const canonical = stem
     .replace(/([a-z0-9])([A-Z])/gu, '$1 $2')
     .replace(/([A-Z]+)([A-Z][a-z])/gu, '$1 $2')
-    .normalize('NFKC')
     .toLowerCase();
   return {
     extension,
@@ -286,7 +328,11 @@ function hasCredentialBasename(name: string): boolean {
   if (tokens.length === 1 && CREDENTIAL_SINGLETON_TOKENS.has(tokens[0] as string)) {
     return true;
   }
-  if (tokens.some((token) => CREDENTIAL_ANYWHERE_TOKENS.has(token))) {
+  if (
+    tokens.length === 2 &&
+    CREDENTIAL_PROVIDER_TOKENS.has(tokens[0] as string) &&
+    CREDENTIAL_SINGLETON_TOKENS.has(tokens[1] as string)
+  ) {
     return true;
   }
   for (let index = 0; index + 1 < tokens.length; index += 1) {

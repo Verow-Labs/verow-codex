@@ -105,6 +105,27 @@ describe('migration asset inventory', () => {
     }
   });
 
+  it('inspects namespace-resolved prefixed SVG roots and rejects unsafe or malformed variants', async () => {
+    for (const source of [
+      '<s:svg xmlns:s="http://www.w3.org/2000/svg" width="1" height="1"><s:rect width="1" height="1"/></s:svg>',
+      '<vector:svg xmlns:vector="http://www.w3.org/2000/svg" width="1" height="1"><vector:path d="M0 0"/></vector:svg>',
+    ]) {
+      await expect(inspectMigrationAssetBytes(Buffer.from(source))).resolves.toMatchObject({
+        mime: 'image/svg+xml',
+      });
+    }
+
+    for (const source of [
+      '<s:svg xmlns:s="http://www.w3.org/2000/svg"><s:script>alert(1)</s:script></s:svg>',
+      '<s:svg xmlns:s="http://www.w3.org/2000/svg"><s:use href="https://example.test/x.svg#x"/></s:svg>',
+      '<s:svg xmlns:s="https://example.test/not-svg"><s:path d="M0 0"/></s:svg>',
+      '<s:svg><s:path d="M0 0"/></s:svg>',
+      '<s:svg xmlns:s="http://www.w3.org/2000/svg"><other:path d="M0 0"/></s:svg>',
+    ]) {
+      await expect(inspectMigrationAssetBytes(Buffer.from(source))).resolves.toBeNull();
+    }
+  });
+
   it('deduplicates identical editorial PNG bytes while retaining sorted references and inspected oriented metadata', async () => {
     const result = await inventoryMigrationAssets({
       assets: [

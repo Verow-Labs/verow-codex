@@ -1009,6 +1009,40 @@ describe('deterministic migration bundle', () => {
     await expect(createMigrationBundle(missing)).resolves.toBeDefined();
   });
 
+  it('requires exact structural closure for namespace-prefixed whole-document SVG roots', async () => {
+    const svgBytes = encoder.encode(
+      '<s:svg xmlns:s="http://www.w3.org/2000/svg" width="1" height="1"><s:rect width="1" height="1"/></s:svg>',
+    );
+    const structuralPath = 'public/prefixed-vector.data';
+    const candidate = [...baseCandidate, { path: structuralPath, bytes: svgBytes, executable: false }];
+    const missing = input({ candidate, artifacts: artifacts(candidate).compiled });
+    await expect(createMigrationBundle(missing)).rejects.toThrow(/^bundle_contract_invalid$/u);
+
+    missing.artifacts.privateManifest.structuralAssets = [{
+      digest: sha256(svgBytes),
+      mime: 'image/svg+xml',
+      references: [{ id: 'prefixed-vector', sourcePath: structuralPath }],
+    }];
+    relinkArtifactDigests(missing.artifacts);
+    await expect(createMigrationBundle(missing)).resolves.toBeDefined();
+  });
+
+  it('blocks unsafe and namespace-invalid prefixed SVG roots outside structural closure', async () => {
+    for (const [name, source] of [
+      ['script', '<s:svg xmlns:s="http://www.w3.org/2000/svg"><s:script>alert(1)</s:script></s:svg>'],
+      ['external', '<s:svg xmlns:s="http://www.w3.org/2000/svg"><s:use href="https://example.test/x.svg#x"/></s:svg>'],
+      ['namespace', '<s:svg xmlns:s="https://example.test/not-svg"><s:path d="M0 0"/></s:svg>'],
+      ['unresolved', '<s:svg><s:path d="M0 0"/></s:svg>'],
+    ] as const) {
+      const bytes = encoder.encode(source);
+      const path = `public/prefixed-${name}.txt`;
+      const candidate = [...baseCandidate, { path, bytes, executable: false }];
+      await expect(
+        createMigrationBundle(input({ candidate, artifacts: artifacts(candidate).compiled })),
+      ).rejects.toThrow(/^bundle_contract_invalid$/u);
+    }
+  });
+
   it('rejects unsafe renamed SVG documents instead of admitting them as source text', async () => {
     for (const [name, source] of [
       ['script', '<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>'],
@@ -1037,13 +1071,18 @@ describe('deterministic migration bundle', () => {
         executable: false,
       },
       {
+        path: 'components/prefixed-icon.tsx',
+        bytes: encoder.encode("export const icon = '<s:svg xmlns:s=\\\"http://www.w3.org/2000/svg\\\"></s:svg>';\n"),
+        executable: false,
+      },
+      {
         path: 'config/feed.xml',
         bytes: encoder.encode('<?xml version="1.0"?><configuration><item/></configuration>'),
         executable: false,
       },
       {
         path: 'public/page.html',
-        bytes: encoder.encode('<!doctype html><html><body><svg></svg></body></html>'),
+        bytes: encoder.encode('<!doctype html><html><body><svg></svg><s:svg xmlns:s="http://www.w3.org/2000/svg"></s:svg></body></html>'),
         executable: false,
       },
     ];

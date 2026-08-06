@@ -102,6 +102,12 @@ describe('migration archive admission policy', () => {
     'config/sendgrid_api_key.txt',
     'config/aws-access-key-id',
     'config/awsAccessKeyId.json',
+    'config/api-secret.json',
+    'config/access-credential.json',
+    'config/private-token.yaml',
+    'config/client-key.json',
+    'config/service-secret.env',
+    'config/tokens.yaml',
     'fixture.zst',
     'bundle.tar.zst',
     'bundle.tar.zstd',
@@ -116,6 +122,9 @@ describe('migration archive admission policy', () => {
   it('does not confuse ordinary source names with credential material', () => {
     expect(() =>
       assertArchiveEntries([
+        entry('config/design-token.json'),
+        entry('config/token-bucket.json'),
+        entry('config/secret-santa.json'),
         entry('styles/design-tokens.css'),
         entry('lib/tokenizer.ts'),
         entry('people/secretary.ts'),
@@ -128,6 +137,46 @@ describe('migration archive admission policy', () => {
         entry('config/auth-provider.json'),
         entry('config/design-tokens.json'),
         entry('docker/config.example.json'),
+      ]),
+    ).not.toThrow();
+  });
+
+  it('classifies Unicode compatibility credential names after normalization without changing paths', () => {
+    for (const path of [
+      'config/ａｐｉＫｅｙ.json',
+      'config/ｃｌｉｅｎｔＳｅｃｒｅｔ.yaml',
+      'config/ｓｅｒｖｉｃｅＡｃｃｏｕｎｔ.toml',
+      'config/𝖆𝖕𝖎Key.json',
+      'config/ApiKEY.json',
+    ]) {
+      expect(() => assertArchiveEntries([entry(path)])).toThrow(/^bundle_entry_forbidden$/u);
+    }
+
+    expect(() =>
+      assertArchiveEntries([
+        entry('config/ｄｅｓｉｇｎＴｏｋｅｎ.json'),
+        entry('config/ｔｏｋｅｎＢｕｃｋｅｔ.json'),
+      ]),
+    ).not.toThrow();
+  });
+
+  it('rejects generated provider state roots but admits similarly named source paths', () => {
+    for (const path of [
+      '.netlify/state.json',
+      'site/.firebase/hosting.c3l0ZQ.cache',
+      'apps/web/.amplify/#current-cloud-backend/backend-config.json',
+      'packages/site/.sst/stage.json',
+    ]) {
+      expect(() => assertArchiveEntries([entry(path)])).toThrow(/^bundle_entry_forbidden$/u);
+    }
+
+    expect(() =>
+      assertArchiveEntries([
+        entry('netlify/state.ts'),
+        entry('firebase/hosting.ts'),
+        entry('amplify/backend.ts'),
+        entry('sst/stage.ts'),
+        entry('.netlify-source/config.ts'),
       ]),
     ).not.toThrow();
   });

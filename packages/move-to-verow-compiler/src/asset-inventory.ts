@@ -390,6 +390,7 @@ function validCaptureReceiptLinkage(receipt: CaptureReceiptV1, bytes: Uint8Array
 }
 
 const SVG_DOCUMENT_PREFIX_BYTES = 65_536;
+const SVG_NAMESPACE = 'http://www.w3.org/2000/svg';
 
 function skipAsciiWhitespace(source: string, start: number): number {
   let cursor = start;
@@ -450,7 +451,7 @@ export function hasMigrationSvgDocumentStart(bytes: Uint8Array): boolean {
       cursor = end;
       continue;
     }
-    const root = /^<svg(?=[\t\n\f\r />:]|$)/iu.exec(source.slice(cursor));
+    const root = /^<\s*(?:[A-Za-z_][\w.-]*:)?svg(?=[\t\n\f\r />]|$)/iu.exec(source.slice(cursor));
     return root !== null;
   }
   return truncated;
@@ -468,6 +469,29 @@ function stripSvgXmlDeclaration(source: string): string | null {
 
 interface SvgElementFrame { id?: string; tag: string }
 
+function svgBytesForMetadata(bytes: Uint8Array): Uint8Array | null {
+  let source: string;
+  try {
+    source = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  } catch {
+    return null;
+  }
+  const declarationFreeSource = stripSvgXmlDeclaration(source);
+  if (declarationFreeSource === null) return null;
+  const rootName = /^<((?:[A-Za-z_][\w.-]*:)?svg)(?=[\t\n\f\r />]|$)/u.exec(declarationFreeSource)?.[1];
+  if (rootName === undefined || !rootName.includes(':')) return bytes;
+  const prefix = rootName.slice(0, rootName.indexOf(':'));
+  const namespacePattern = new RegExp(
+    `\\s+xmlns:${prefix}\\s*=\\s*(["'])${SVG_NAMESPACE}\\1`,
+    'u',
+  );
+  const metadataSource = source
+    .replaceAll(`<${prefix}:`, '<')
+    .replaceAll(`</${prefix}:`, '</')
+    .replace(namespacePattern, ` xmlns="${SVG_NAMESPACE}"`);
+  return Buffer.from(metadataSource, 'utf8');
+}
+
 function validateSafeSvg(bytes: Uint8Array, limits: AssetInventoryLimits): boolean {
   if (bytes.byteLength > limits.maxSvgBytes) return false;
   let source: string;
@@ -479,6 +503,10 @@ function validateSafeSvg(bytes: Uint8Array, limits: AssetInventoryLimits): boole
   const declarationFreeSource = stripSvgXmlDeclaration(source);
   if (declarationFreeSource === null) return false;
   source = declarationFreeSource;
+  const rootName = /^<((?:[A-Za-z_][\w.-]*:)?svg)(?=[\t\n\f\r />]|$)/u.exec(source)?.[1];
+  if (rootName === undefined) return false;
+  const rootSeparator = rootName.indexOf(':');
+  const rootPrefix = rootSeparator < 0 ? null : rootName.slice(0, rootSeparator);
   if (hasControlCharacters(source) || /<!DOCTYPE|<!ENTITY|<!\[CDATA|<!--|<\?(?!xml\s)|&/iu.test(source)) return false;
   if (/<\s*(?:script|foreignObject|style|animate|animateMotion|animateTransform|set|filter|fe\w+|image|audio|video|iframe|object|embed|link|meta)\b/iu.test(source)) return false;
   if (/\son[a-z][\w:-]*\s*=|\sstyle\s*=|@import|url\s*\(/iu.test(source)) return false;
@@ -495,6 +523,7 @@ function validateSafeSvg(bytes: Uint8Array, limits: AssetInventoryLimits): boole
   const tokenPattern = /<\s*(\/?)\s*([A-Za-z][\w:-]*)([^<>]*?)(\/?)\s*>/gu;
   let lastIndex = 0;
   let rootSeen = false;
+  let rootNamespaceSeen = rootPrefix === null;
   let referenceCount = 0;
   let match: RegExpExecArray | null;
   while ((match = tokenPattern.exec(source)) !== null) {
@@ -502,14 +531,26 @@ function validateSafeSvg(bytes: Uint8Array, limits: AssetInventoryLimits): boole
     if (/[<>]/u.test(between)) return false;
     lastIndex = tokenPattern.lastIndex;
     const closing = match[1] === '/';
-    const tag = (match[2] ?? '').toLowerCase();
+    const rawTag = match[2] ?? '';
+    const separator = rawTag.indexOf(':');
+    const tagPrefix = separator < 0 ? null : rawTag.slice(0, separator);
+    const localTag = separator < 0 ? rawTag : rawTag.slice(separator + 1);
+    if (
+      (rootPrefix === null && tagPrefix !== null) ||
+      (rootPrefix !== null && tagPrefix !== rootPrefix) ||
+      (rootPrefix !== null && localTag !== localTag.toLowerCase())
+    ) {
+      return false;
+    }
+    const tag = localTag.toLowerCase();
     if (!allowedTags.has(tag)) return false;
     if (closing) {
       if ((match[3] ?? '').trim() || match[4] === '/' || stack.at(-1)?.tag !== tag) return false;
       stack.pop();
       continue;
     }
-    if (!rootSeen) {
+    const isRoot = !rootSeen;
+    if (isRoot) {
       if (tag !== 'svg') return false;
       rootSeen = true;
     }
@@ -521,9 +562,21 @@ function validateSafeSvg(bytes: Uint8Array, limits: AssetInventoryLimits): boole
     while ((attribute = attributePattern.exec(rawAttributes)) !== null) {
       if (rawAttributes.slice(attributeCursor, attribute.index).trim()) return false;
       attributeCursor = attributePattern.lastIndex;
-      const name = (attribute[1] ?? '').toLowerCase();
+      const rawName = attribute[1] ?? '';
+      const name = rawName.toLowerCase();
       const value = attribute[2] ?? attribute[3] ?? '';
-      if (!allowedAttributes.has(name) || attributes.has(name) || hasControlCharacters(value)) return false;
+      const rootNamespaceName = rootPrefix === null ? null : `xmlns:${rootPrefix}`;
+      const isRootNamespace = isRoot && rawName === rootNamespaceName;
+      if (
+        (!allowedAttributes.has(name) && !isRootNamespace) ||
+        (name.startsWith('xmlns:') && name !== 'xmlns:xlink' && !isRootNamespace) ||
+        attributes.has(name) ||
+        hasControlCharacters(value)
+      ) return false;
+      if (isRootNamespace) {
+        if (value !== SVG_NAMESPACE) return false;
+        rootNamespaceSeen = true;
+      }
       attributes.set(name, value);
     }
     if (rawAttributes.slice(attributeCursor).trim()) return false;
@@ -552,7 +605,7 @@ function validateSafeSvg(bytes: Uint8Array, limits: AssetInventoryLimits): boole
       if (stack.length > 256) return false;
     }
   }
-  if (!rootSeen || stack.length > 0 || /[<>]/u.test(source.slice(lastIndex)) || [...referenced].some((id) => !ids.has(id))) return false;
+  if (!rootSeen || !rootNamespaceSeen || stack.length > 0 || /[<>]/u.test(source.slice(lastIndex)) || [...referenced].some((id) => !ids.has(id))) return false;
   const visiting = new Set<string>();
   const visited = new Set<string>();
   const cyclic = (node: string): boolean => {
@@ -767,8 +820,10 @@ function inspectFontBytes(bytes: Uint8Array, limits: AssetInventoryLimits): { mi
 async function inspectImage(bytes: Uint8Array, limits: AssetInventoryLimits): Promise<Omit<InventoriedAsset, 'digest' | 'bytes' | 'bytesValue' | 'references'> | null> {
   const svg = hasMigrationSvgDocumentStart(bytes);
   if (svg ? !validateSafeSvg(bytes, limits) : !validRasterContainer(bytes)) return null;
+  const inspectionBytes = svg ? svgBytesForMetadata(bytes) : bytes;
+  if (inspectionBytes === null) return null;
   try {
-    const metadata: Metadata = await sharp(bytes, { animated: true, failOn: 'error', limitInputPixels: limits.maxPixels, sequentialRead: true }).metadata();
+    const metadata: Metadata = await sharp(inspectionBytes, { animated: true, failOn: 'error', limitInputPixels: limits.maxPixels, sequentialRead: true }).metadata();
     const format = metadata.format;
     const mime = format === undefined ? undefined : MIME_BY_FORMAT[format];
     const encodedWidth = metadata.width;
