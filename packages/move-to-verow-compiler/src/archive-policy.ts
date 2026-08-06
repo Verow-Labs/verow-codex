@@ -66,6 +66,7 @@ const FORBIDDEN_SEGMENTS = new Set([
 const FORBIDDEN_NAMES = new Set([
   '.bash_history',
   '.ds_store',
+  '.netrc',
   '.npmrc',
   '.pypirc',
   '.shell_history',
@@ -133,12 +134,29 @@ function plainArray<T>(value: unknown): value is T[] {
   );
 }
 
+function plainArrayLength(value: unknown): number | null {
+  if (
+    value === null ||
+    typeof value !== 'object' ||
+    nodeUtilTypes.isProxy(value) ||
+    !Array.isArray(value)
+  ) {
+    return null;
+  }
+  return value.length;
+}
+
 export function isSafeByteArray(value: unknown): value is Uint8Array {
-  if (!(value instanceof Uint8Array) || Object.getPrototypeOf(value) !== Uint8Array.prototype) {
+  if (value === null || typeof value !== 'object' || nodeUtilTypes.isProxy(value)) return false;
+  try {
+    if (!(value instanceof Uint8Array) || Object.getPrototypeOf(value) !== Uint8Array.prototype) {
+      return false;
+    }
+    if (!(value.buffer instanceof ArrayBuffer) || value.byteOffset !== 0) return false;
+    return value.byteLength === value.buffer.byteLength;
+  } catch {
     return false;
   }
-  if (!(value.buffer instanceof ArrayBuffer) || value.byteOffset !== 0) return false;
-  return value.byteLength === value.buffer.byteLength;
 }
 
 function extension(path: string): string {
@@ -157,6 +175,9 @@ function forbiddenName(path: string): boolean {
   if (name.endsWith('.pem') || name.endsWith('.key') || name.endsWith('.p12') || name.endsWith('.pfx')) return true;
   if (name.endsWith('.tfstate') || name.endsWith('.tfstate.backup')) return true;
   if (/^(?:task-|compiler-).*(?:receipt|report).*\.json$/u.test(name)) return true;
+  if (/^secrets?\.(?:ini|json|toml|txt|ya?ml)$/u.test(name)) return true;
+  if (/^(?:access|api|auth|client|refresh)[._-](?:credentials?|key|secret|token)(?:[._-][a-z0-9-]+)*\.(?:ini|json|toml|txt|ya?ml)$/u.test(name)) return true;
+  if (/^service[._-]account(?:[._-](?:credentials?|key|secret|token))?(?:[._-][a-z0-9-]+)*\.(?:ini|json|toml|txt|ya?ml)$/u.test(name)) return true;
   return NESTED_ARCHIVE_PATTERN.test(name) || UNSAFE_BINARY_PATTERN.test(name);
 }
 
@@ -211,6 +232,27 @@ function hasUnsafeBinaryMagic(bytes: Uint8Array): boolean {
       return true;
     }
   }
+  if (bytes.byteLength >= 6) {
+    const prefix = Buffer.from(bytes.subarray(0, 6)).toString('hex');
+    if (
+      prefix.startsWith('504b0304') ||
+      prefix.startsWith('504b0506') ||
+      prefix.startsWith('504b0708') ||
+      prefix.startsWith('1f8b') ||
+      prefix === '377abcaf271c' ||
+      prefix.startsWith('526172211a07') ||
+      prefix.startsWith('425a68') ||
+      prefix === 'fd377a585a00'
+    ) {
+      return true;
+    }
+  }
+  if (
+    bytes.byteLength >= 262 &&
+    Buffer.from(bytes.subarray(257, 262)).toString('ascii') === 'ustar'
+  ) {
+    return true;
+  }
   return bytes.byteLength >= 2 && bytes[0] === 0x4d && bytes[1] === 0x5a;
 }
 
@@ -239,10 +281,12 @@ export function assertArchiveEntries(
   overrides?: Partial<ArchiveLimits>,
 ): void {
   const limits = resolveArchiveLimits(overrides);
-  if (!plainArray<BundleEntryInput>(entries)) fail('bundle_input_invalid');
-  if (entries.length > limits.maxCandidateEntries || entries.length > limits.maxEntries) {
+  const length = plainArrayLength(entries);
+  if (length === null) fail('bundle_input_invalid');
+  if (length > limits.maxCandidateEntries || length > limits.maxEntries) {
     fail('bundle_limit_exceeded');
   }
+  if (!plainArray<BundleEntryInput>(entries)) fail('bundle_input_invalid');
   const paths = new Set<string>();
   const folded = new Set<string>();
   let total = 0;

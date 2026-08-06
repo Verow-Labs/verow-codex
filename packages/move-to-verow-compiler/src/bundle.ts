@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { types as nodeUtilTypes } from 'node:util';
 import { gzipSync } from 'node:zlib';
 
-import { pack, type Pack } from 'tar-stream';
+import type { Pack } from 'tar-stream';
 
 import {
   assertArchiveEntries,
@@ -22,6 +22,7 @@ import {
 } from './bundle-contract.js';
 import { digestFileInventory, type InventoriedFile } from './inventory.js';
 import {
+  canonicalPublicHttpsUrl as canonicalTask4PublicHttpsUrl,
   CONTENT_FIXTURE_FORMAT,
   PRIVATE_MANIFEST_FORMAT,
   REPOSITORY_BINDING_FORMAT,
@@ -260,6 +261,20 @@ const PRIVATE_TARGET_KEYS = [
   'valueType',
   'variant',
 ] as const;
+const TASK4_ACTIONS = new Set(['create', 'delete', 'edit', 'reorder']);
+const TASK4_SOURCE_KINDS = new Set(['aria', 'css_content', 'json', 'jsx', 'metadata', 'typescript']);
+const TASK4_VALUE_TYPES = new Set(['collection', 'email', 'image', 'rich_text', 'string', 'telephone', 'url']);
+const TASK4_STRUCTURED_FAMILIES = new Set(['blog', 'event', 'faq', 'menu', 'social']);
+const TASK4_ASSET_MIMES = new Set([
+  'font/woff',
+  'font/woff2',
+  'image/avif',
+  'image/gif',
+  'image/jpeg',
+  'image/png',
+  'image/svg+xml',
+  'image/webp',
+]);
 
 function fail(
   code:
@@ -416,6 +431,9 @@ function requireIdentity(value: unknown): void {
 }
 
 function assertArtifactNestedShapes(input: CompiledMigrationArtifacts): void {
+  if (!isPlainArray(input.privateManifest.structuredFamilies, TASK4_STRUCTURED_FAMILIES.size)) {
+    fail('bundle_input_invalid');
+  }
   const contentValues = requireExactItems(
     input.contentFixture.values,
     2_000,
@@ -493,6 +511,291 @@ function assertArtifactNestedShapes(input: CompiledMigrationArtifacts): void {
   if (routes.length !== input.privateManifest.routes.length) fail('bundle_input_invalid');
 }
 
+function validArtifactIdentity(value: unknown): value is MigrationContentIdentity {
+  if (!isPlainRecord(value) || !exactKeys(value, IDENTITY_KEYS)) return false;
+  return (
+    safeString(value.key, 500) &&
+    safeString(value.locale, 100) &&
+    (value.variant === null || safeString(value.variant, 100))
+  );
+}
+
+function validArtifactProtocol(value: unknown): boolean {
+  return (
+    isPlainRecord(value) &&
+    exactKeys(value, ['contractDigest', 'package', 'version']) &&
+    value.package === '@verow/cms-native' &&
+    safeString(value.version, 100) &&
+    VERSION_PATTERN.test(value.version) &&
+    validDigest(value.contractDigest)
+  );
+}
+
+function validArtifactRoute(value: unknown): value is { path: string; renderedSource: string; routeId: string } {
+  if (!isPlainRecord(value) || !exactKeys(value, ['path', 'renderedSource', 'routeId'])) return false;
+  if (
+    !safeString(value.routeId, 200) ||
+    value.routeId === 'global' ||
+    !safeString(value.renderedSource, 500) ||
+    typeof value.path !== 'string' ||
+    value.path !== value.path.normalize('NFC') ||
+    !value.path.startsWith('/') ||
+    value.path.includes('?') ||
+    value.path.includes('#') ||
+    value.path.includes('\\') ||
+    /\p{Cc}/u.test(value.path)
+  ) {
+    return false;
+  }
+  return value.path === '/' || !value.path.split('/').some(
+    (segment, index) => index > 0 && (segment === '' || segment === '.' || segment === '..'),
+  );
+}
+
+function validCanonicalHttps(value: unknown): value is string {
+  return canonicalTask4PublicHttpsUrl(value) !== null;
+}
+
+function sameArtifactIdentity(left: MigrationContentIdentity, right: MigrationContentIdentity): boolean {
+  return left.key === right.key && left.locale === right.locale && left.variant === right.variant;
+}
+
+function assertArtifactSemantics(input: CompiledMigrationArtifacts): void {
+  const { contentFixture, privateManifest, repositoryBinding, runtimeExpectation, digests } = input;
+  if (
+    contentFixture.format !== CONTENT_FIXTURE_FORMAT ||
+    contentFixture.purpose !== 'migration_upload_only' ||
+    privateManifest.format !== PRIVATE_MANIFEST_FORMAT ||
+    repositoryBinding.format !== REPOSITORY_BINDING_FORMAT ||
+    runtimeExpectation.format !== RUNTIME_EXPECTATION_FORMAT ||
+    !UUID_PATTERN.test(contentFixture.websiteId) ||
+    !UUID_PATTERN.test(contentFixture.migrationId) ||
+    !UUID_PATTERN.test(privateManifest.websiteId) ||
+    !UUID_PATTERN.test(privateManifest.migrationId) ||
+    !UUID_PATTERN.test(repositoryBinding.websiteId) ||
+    !UUID_PATTERN.test(repositoryBinding.migrationId) ||
+    !UUID_PATTERN.test(runtimeExpectation.websiteId) ||
+    !UUID_PATTERN.test(runtimeExpectation.migrationId) ||
+    !validDigest(privateManifest.sourceDigest) ||
+    !validDigest(privateManifest.candidateDigest) ||
+    !validDigest(repositoryBinding.sourceDigest) ||
+    !validDigest(repositoryBinding.candidateDigest) ||
+    !validDigest(repositoryBinding.privateManifestDigest) ||
+    !validDigest(runtimeExpectation.expectedPrivateManifestDigest) ||
+    !validDigest(runtimeExpectation.expectedRepositoryBindingDigest) ||
+    !DIGEST_KEYS.every((key) => validDigest(digests[key])) ||
+    !validArtifactProtocol(privateManifest.cmsNativeProtocol) ||
+    !validArtifactProtocol(repositoryBinding.cmsNativeProtocol) ||
+    !validArtifactProtocol(runtimeExpectation.cmsNativeProtocol)
+  ) {
+    fail('bundle_contract_invalid');
+  }
+
+  for (const value of contentFixture.values) {
+    if (!validArtifactIdentity({ key: value.key, locale: value.locale, variant: value.variant }) || typeof value.value !== 'string') {
+      fail('bundle_contract_invalid');
+    }
+  }
+  for (const asset of contentFixture.editorialAssets) {
+    if (!validDigest(asset.digest) || !validArtifactIdentity(asset.target)) fail('bundle_contract_invalid');
+  }
+  for (const asset of contentFixture.externalAssets) {
+    if (!validArtifactIdentity(asset.target) || !validCanonicalHttps(asset.url)) fail('bundle_contract_invalid');
+  }
+
+  const routes = new Map<string, { path: string; renderedSource: string; routeId: string }>();
+  const routePaths = new Set<string>();
+  for (const route of privateManifest.routes) {
+    if (!validArtifactRoute(route) || routes.has(route.routeId) || routePaths.has(route.path)) {
+      fail('bundle_contract_invalid');
+    }
+    routes.set(route.routeId, route);
+    routePaths.add(route.path);
+  }
+  if (
+    privateManifest.structuredFamilies.some(
+      (family) => typeof family !== 'string' || !TASK4_STRUCTURED_FAMILIES.has(family),
+    ) ||
+    new Set(privateManifest.structuredFamilies).size !== privateManifest.structuredFamilies.length
+  ) {
+    fail('bundle_contract_invalid');
+  }
+
+  const targetIdentities = new Map<string, (typeof privateManifest.targets)[number]>();
+  for (const target of privateManifest.targets) {
+    if (
+      !validArtifactIdentity({ key: target.key, locale: target.locale, variant: target.variant }) ||
+      !safeString(target.label, 2_000) ||
+      !safeString(target.routeId, 200) ||
+      !safeString(target.sourceEvidence.path, 2_000) ||
+      !safeString(target.sourceEvidence.anchor, 2_000) ||
+      target.binding.kind !== 'logical_content_key' ||
+      target.binding.key !== target.key ||
+      typeof target.required !== 'boolean' ||
+      !['one', 'many'].includes(target.cardinality) ||
+      !['global', 'none', 'route'].includes(target.liveVerification) ||
+      !TASK4_SOURCE_KINDS.has(target.sourceKind) ||
+      !TASK4_VALUE_TYPES.has(target.valueType) ||
+      !isPlainArray<string>(target.actions, TASK4_ACTIONS.size) ||
+      target.actions.length === 0 ||
+      target.actions.some((action) => typeof action !== 'string' || !TASK4_ACTIONS.has(action)) ||
+      new Set(target.actions).size !== target.actions.length
+    ) {
+      fail('bundle_contract_invalid');
+    }
+    if (
+      (target.owner === 'site_region' && target.structuredFamily !== null) ||
+      (target.owner === 'structured_family' &&
+        (target.structuredFamily === null || !TASK4_STRUCTURED_FAMILIES.has(target.structuredFamily))) ||
+      (target.owner !== 'site_region' && target.owner !== 'structured_family')
+    ) {
+      fail('bundle_contract_invalid');
+    }
+    const route = routes.get(target.routeId);
+    if (
+      (target.routeId === 'global' && target.route !== null) ||
+      (target.routeId !== 'global' &&
+        (route === undefined ||
+          target.route === null ||
+          !validArtifactRoute(target.route) ||
+          target.route.routeId !== route.routeId ||
+          target.route.path !== route.path ||
+          target.route.renderedSource !== route.renderedSource))
+    ) {
+      fail('bundle_contract_invalid');
+    }
+    if (
+      target.imagePair !== null &&
+      (!['alt', 'image'].includes(target.imagePair.role) || !validArtifactIdentity(target.imagePair.target))
+    ) {
+      fail('bundle_contract_invalid');
+    }
+    if (target.collection !== null) {
+      const { minimumItems, maximumItems, requiredItemIds } = target.collection;
+      if (
+        !Number.isSafeInteger(minimumItems) ||
+        !Number.isSafeInteger(maximumItems) ||
+        minimumItems < 0 ||
+        maximumItems < minimumItems ||
+        maximumItems > 1_000 ||
+        !isPlainArray<string>(requiredItemIds, 1_000) ||
+        requiredItemIds.some((item) => !safeString(item, 200)) ||
+        new Set(requiredItemIds).size !== requiredItemIds.length
+      ) {
+        fail('bundle_contract_invalid');
+      }
+    }
+    if ((target.valueType === 'collection') !== (target.collection !== null)) {
+      fail('bundle_contract_invalid');
+    }
+    if (
+      (target.editorialAssetDigest !== null && !validDigest(target.editorialAssetDigest)) ||
+      (target.externalBoundary !== null && !safeString(target.externalBoundary, 2_000)) ||
+      (target.externalUrl !== null && !validCanonicalHttps(target.externalUrl)) ||
+      ((target.externalBoundary === null) !== (target.externalUrl === null)) ||
+      (target.editorialAssetDigest !== null && target.externalUrl !== null) ||
+      ((target.editorialAssetDigest !== null || target.externalUrl !== null) && target.valueType !== 'image')
+    ) {
+      fail('bundle_contract_invalid');
+    }
+    const key = identityKey(target);
+    if (targetIdentities.has(key)) fail('bundle_contract_invalid');
+    targetIdentities.set(key, target);
+  }
+  for (const target of privateManifest.targets) {
+    if (target.imagePair === null) continue;
+    const pair = targetIdentities.get(identityKey(target.imagePair.target));
+    if (
+      pair === undefined ||
+      pair.imagePair === null ||
+      !sameArtifactIdentity(pair.imagePair.target, target) ||
+      pair.imagePair.role === target.imagePair.role ||
+      pair.locale !== target.locale ||
+      pair.variant !== target.variant ||
+      (target.imagePair.role === 'image' && (target.valueType !== 'image' || pair.valueType !== 'string')) ||
+      (target.imagePair.role === 'alt' && (target.valueType !== 'string' || pair.valueType !== 'image'))
+    ) {
+      fail('bundle_contract_invalid');
+    }
+  }
+  const usedFamilies = new Set(
+    privateManifest.targets.flatMap((target) =>
+      target.structuredFamily === null ? [] : [target.structuredFamily],
+    ),
+  );
+  if (
+    usedFamilies.size !== privateManifest.structuredFamilies.length ||
+    privateManifest.structuredFamilies.some((family) => !usedFamilies.has(family))
+  ) {
+    fail('bundle_contract_invalid');
+  }
+
+  const privateDeclarationIds = new Set<string>();
+  for (const boundary of privateManifest.thirdPartyBoundaries) {
+    if (
+      !validArtifactIdentity({ key: boundary.key, locale: boundary.locale, variant: boundary.variant }) ||
+      !safeString(boundary.provider, 2_000) ||
+      !safeString(boundary.integration, 2_000) ||
+      !safeString(boundary.renderedAnchor, 2_000) ||
+      !safeString(boundary.sourcePath, 2_000) ||
+      !safeString(boundary.sourceAnchor, 2_000)
+    ) {
+      fail('bundle_contract_invalid');
+    }
+    const key = identityKey(boundary);
+    if (privateDeclarationIds.has(key) || targetIdentities.has(key)) fail('bundle_contract_invalid');
+    privateDeclarationIds.add(key);
+  }
+  for (const declaration of [...privateManifest.derived, ...privateManifest.structural]) {
+    if (
+      !validArtifactIdentity({ key: declaration.key, locale: declaration.locale, variant: declaration.variant }) ||
+      !safeString(declaration.routeId, 200) ||
+      (declaration.routeId !== 'global' && !routes.has(declaration.routeId)) ||
+      !safeString(declaration.sourcePath, 2_000) ||
+      !safeString(declaration.sourceAnchor, 2_000) ||
+      ('derivedFrom' in declaration && !safeString(declaration.derivedFrom, 500)) ||
+      ('reason' in declaration && !['aria_hidden_decorative_asset', 'explicit_structural_annotation'].includes(declaration.reason))
+    ) {
+      fail('bundle_contract_invalid');
+    }
+    const key = identityKey(declaration);
+    if (privateDeclarationIds.has(key) || targetIdentities.has(key)) fail('bundle_contract_invalid');
+    privateDeclarationIds.add(key);
+  }
+  const structuralDigests = new Set<string>();
+  for (const asset of privateManifest.structuralAssets) {
+    if (
+      !validDigest(asset.digest) ||
+      !TASK4_ASSET_MIMES.has(asset.mime) ||
+      asset.references.length === 0 ||
+      structuralDigests.has(asset.digest)
+    ) {
+      fail('bundle_contract_invalid');
+    }
+    structuralDigests.add(asset.digest);
+    const references = new Set<string>();
+    for (const reference of asset.references) {
+      if (!safeString(reference.id, 500) || !safeString(reference.sourcePath, 2_000)) {
+        fail('bundle_contract_invalid');
+      }
+      const key = `${reference.sourcePath}\u0000${reference.id}`;
+      if (references.has(key)) fail('bundle_contract_invalid');
+      references.add(key);
+    }
+  }
+
+  if (
+    repositoryBinding.runtimeBinding.strategy !== 'canonical_content_identity' ||
+    repositoryBinding.runtimeBinding.identityVersion !== 1 ||
+    repositoryBinding.bindings.some((binding) => !validArtifactIdentity(binding)) ||
+    Object.values(runtimeExpectation.counts).some(
+      (count) => !Number.isSafeInteger(count) || count < 0 || count > 2_000,
+    )
+  ) {
+    fail('bundle_contract_invalid');
+  }
+}
+
 function identityKey(identity: MigrationContentIdentity): string {
   return `${identity.key}\u0000${identity.locale}\u0000${identity.variant ?? ''}`;
 }
@@ -536,6 +839,7 @@ function normalizeArtifacts(input: CompiledMigrationArtifacts): CompiledMigratio
     if (length > 2_000) fail('bundle_limit_exceeded');
   }
   assertArtifactNestedShapes(input);
+  assertArtifactSemantics(input);
 
   const copy = canonicalCopy(input);
   sortIdentities(copy.contentFixture.values);
@@ -738,12 +1042,73 @@ function normalizedEditorialAssets(
   return assets;
 }
 
+function startsWithBytes(bytes: Uint8Array, prefix: readonly number[]): boolean {
+  return prefix.length <= bytes.byteLength && prefix.every((value, index) => bytes[index] === value);
+}
+
+function inspectedAssetMime(path: string, bytes: Uint8Array): string | null {
+  if (startsWithBytes(bytes, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) return 'image/png';
+  if (startsWithBytes(bytes, [0xff, 0xd8, 0xff])) return 'image/jpeg';
+  if (
+    startsWithBytes(bytes, [0x47, 0x49, 0x46, 0x38, 0x37, 0x61]) ||
+    startsWithBytes(bytes, [0x47, 0x49, 0x46, 0x38, 0x39, 0x61])
+  ) {
+    return 'image/gif';
+  }
+  if (
+    bytes.byteLength >= 12 &&
+    Buffer.from(bytes.subarray(0, 4)).toString('ascii') === 'RIFF' &&
+    Buffer.from(bytes.subarray(8, 12)).toString('ascii') === 'WEBP'
+  ) {
+    return 'image/webp';
+  }
+  if (
+    bytes.byteLength >= 12 &&
+    Buffer.from(bytes.subarray(4, 8)).toString('ascii') === 'ftyp' &&
+    ['avif', 'avis'].includes(Buffer.from(bytes.subarray(8, 12)).toString('ascii'))
+  ) {
+    return 'image/avif';
+  }
+  if (startsWithBytes(bytes, [0x77, 0x4f, 0x46, 0x46])) return 'font/woff';
+  if (startsWithBytes(bytes, [0x77, 0x4f, 0x46, 0x32])) return 'font/woff2';
+  let text: string;
+  try {
+    text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  } catch {
+    return null;
+  }
+  if (
+    (path.toLowerCase().endsWith('.svg') || /<svg(?:\s|>)/u.test(text)) &&
+    /^\s*(?:<\?xml[^>]*>\s*)?(?:<!--[\s\S]*?-->\s*)*<svg(?:\s|>)/u.test(text)
+  ) {
+    return 'image/svg+xml';
+  }
+  return null;
+}
+
+function isAdmittedSourceText(bytes: Uint8Array): boolean {
+  let text: string;
+  try {
+    text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  } catch {
+    return false;
+  }
+  for (const character of text) {
+    const code = character.codePointAt(0) as number;
+    if ((code <= 0x1f && code !== 0x09 && code !== 0x0a && code !== 0x0d) || code === 0x7f) {
+      return false;
+    }
+  }
+  return true;
+}
+
 function assertArtifactContracts(
   artifacts: CompiledMigrationArtifacts,
-  input: CreateMigrationBundleInput,
+  input: Pick<CreateMigrationBundleInput, 'migrationId' | 'sourceDigest' | 'websiteId'>,
   candidateDigest: Digest,
   sourceDigest: Digest,
   candidateDigests: ReadonlyMap<string, Digest>,
+  candidate: readonly BundleEntryInput[],
   editorialAssets: readonly EditorialAssetBlobInput[],
 ): void {
   const { contentFixture, privateManifest, repositoryBinding, runtimeExpectation, digests } = artifacts;
@@ -763,6 +1128,9 @@ function assertArtifactContracts(
   };
   const targetIdentities = identitySet(privateManifest.targets);
   const valueIdentities = identitySet(contentFixture.values);
+  const valuesByTarget = new Map(
+    contentFixture.values.map((value) => [identityKey(value), value.value]),
+  );
   const bindingIdentities = identitySet(repositoryBinding.bindings);
   if (
     targetIdentities.size !== valueIdentities.size ||
@@ -795,9 +1163,11 @@ function assertArtifactContracts(
   }
   for (const target of privateManifest.targets) {
     const identity = identityKey(target);
+    const expectedImageValue = editorialByTarget.get(identity) ?? externalByTarget.get(identity);
     if (
       (target.editorialAssetDigest ?? null) !== (editorialByTarget.get(identity) ?? null) ||
-      (target.externalUrl ?? null) !== (externalByTarget.get(identity) ?? null)
+      (target.externalUrl ?? null) !== (externalByTarget.get(identity) ?? null) ||
+      (target.valueType === 'image' && valuesByTarget.get(identity) !== expectedImageValue)
     ) {
       fail('bundle_contract_invalid');
     }
@@ -863,7 +1233,7 @@ function assertArtifactContracts(
     if (sha256(asset.bytes) !== asset.digest) fail('bundle_contract_invalid');
   }
   const structuralDigests = new Set<string>();
-  const structuralPaths = new Set<string>();
+  const structuralMimeByPath = new Map<string, string>();
   for (const asset of privateManifest.structuralAssets) {
     if (asset.references.length === 0 || structuralDigests.has(asset.digest)) {
       fail('bundle_contract_invalid');
@@ -874,11 +1244,20 @@ function assertArtifactContracts(
       if (candidateDigests.get(reference.sourcePath) !== asset.digest) {
         fail('bundle_contract_invalid');
       }
-      structuralPaths.add(reference.sourcePath);
+      structuralMimeByPath.set(reference.sourcePath, asset.mime);
     }
   }
-  for (const path of candidateDigests.keys()) {
-    if (/\.(?:avif|gif|jpe?g|png|webp|woff2?)$/iu.test(path) && !structuralPaths.has(path)) {
+  for (const entry of candidate) {
+    const mime = inspectedAssetMime(entry.path, entry.bytes);
+    const declaredMime = structuralMimeByPath.get(entry.path);
+    if (mime !== null) {
+      if (declaredMime !== mime) fail('bundle_contract_invalid');
+    } else if (entry.path.toLowerCase().endsWith('.svg')) {
+      fail('bundle_contract_invalid');
+    } else if (!isAdmittedSourceText(entry.bytes)) {
+      fail('bundle_entry_forbidden');
+    }
+    if (declaredMime !== undefined && mime !== declaredMime) {
       fail('bundle_contract_invalid');
     }
   }
@@ -931,21 +1310,207 @@ function assertFinalEntries(entries: readonly ArchiveEntry[], limits: ArchiveLim
 
 async function encodeDeterministicArchive(
   entries: readonly ArchiveEntry[],
-  packFactory: TarPackFactory,
+  packFactory?: TarPackFactory,
 ): Promise<EncodedArchive> {
   try {
-    const archive = packFactory();
+    const tarBytes = packFactory === undefined
+      ? encodeUstar(entries)
+      : await encodePackStream(entries, packFactory);
+    assertPhysicalArchive(tarBytes, entries);
+    const gzipBytes = new Uint8Array(gzipSync(tarBytes, { level: 9 }));
+    if (gzipBytes.byteLength < 10) fail('bundle_archive_failed');
+    gzipBytes[9] = 3;
+    return {
+      bytes: gzipBytes,
+      expandedBytes: tarBytes.byteLength,
+    };
+  } catch {
+    fail('bundle_archive_failed');
+  }
+}
+
+function writeOctal(target: Uint8Array, offset: number, width: number, value: number): void {
+  if (!Number.isSafeInteger(value) || value < 0) throw new Error('invalid tar number');
+  const text = value.toString(8).padStart(width - 1, '0');
+  if (text.length !== width - 1) throw new Error('tar number overflow');
+  target.set(Buffer.from(text, 'ascii'), offset);
+  target[offset + width - 1] = 0;
+}
+
+function encodeUstarHeader(entry: ArchiveEntry): Uint8Array {
+  const header = new Uint8Array(512);
+  const name = Buffer.from(entry.path, 'utf8');
+  if (name.byteLength === 0 || name.byteLength > 100) throw new Error('invalid tar path');
+  header.set(name, 0);
+  writeOctal(header, 100, 8, entry.mode);
+  writeOctal(header, 108, 8, 0);
+  writeOctal(header, 116, 8, 0);
+  writeOctal(header, 124, 12, entry.bytes.byteLength);
+  writeOctal(header, 136, 12, 0);
+  header.fill(0x20, 148, 156);
+  header[156] = 0x30;
+  header.set(Buffer.from('ustar\0', 'ascii'), 257);
+  header.set(Buffer.from('00', 'ascii'), 263);
+  const checksum = header.reduce((total, byte) => total + byte, 0);
+  const checksumText = checksum.toString(8).padStart(6, '0');
+  if (checksumText.length !== 6) throw new Error('tar checksum overflow');
+  header.set(Buffer.from(checksumText, 'ascii'), 148);
+  header[154] = 0;
+  header[155] = 0x20;
+  return header;
+}
+
+function encodeUstar(entries: readonly ArchiveEntry[]): Uint8Array {
+  // tar-stream emits a PAX record when UTF-8 byte length differs from JS string length.
+  // This reviewed USTAR encoder preserves NFC UTF-8 path bytes without hidden records.
+  const chunks: Uint8Array[] = [];
+  for (const entry of entries) {
+    chunks.push(encodeUstarHeader(entry), entry.bytes);
+    const padding = (512 - (entry.bytes.byteLength % 512)) % 512;
+    if (padding > 0) chunks.push(new Uint8Array(padding));
+  }
+  chunks.push(new Uint8Array(1_024));
+  return new Uint8Array(Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))));
+}
+
+function parseTarOctal(field: Uint8Array): number {
+  const text = Buffer.from(field).toString('ascii').replace(/\0.*$/u, '').trim();
+  if (!/^[0-7]+$/u.test(text)) throw new Error('invalid tar octal');
+  const value = Number.parseInt(text, 8);
+  if (!Number.isSafeInteger(value)) throw new Error('invalid tar octal');
+  return value;
+}
+
+function allZero(bytes: Uint8Array): boolean {
+  return bytes.every((byte) => byte === 0);
+}
+
+function assertPhysicalArchive(tarBytes: Uint8Array, expected: readonly ArchiveEntry[]): void {
+  if (tarBytes.byteLength < 1_024 || tarBytes.byteLength % 512 !== 0) {
+    throw new Error('invalid tar length');
+  }
+  const physical: Array<{ path: string; bytes: Uint8Array; mode: number }> = [];
+  let offset = 0;
+  for (const entry of expected) {
+    if (offset + 512 > tarBytes.byteLength) throw new Error('missing tar header');
+    const header = tarBytes.subarray(offset, offset + 512);
+    if (allZero(header)) throw new Error('premature tar end');
+    const pathBytes = Buffer.from(entry.path, 'utf8');
+    const nameField = header.subarray(0, 100);
+    if (
+      !Buffer.from(nameField.subarray(0, pathBytes.byteLength)).equals(pathBytes) ||
+      !allZero(nameField.subarray(pathBytes.byteLength)) ||
+      header[156] !== 0x30 ||
+      Buffer.from(header.subarray(257, 263)).toString('ascii') !== 'ustar\0' ||
+      Buffer.from(header.subarray(263, 265)).toString('ascii') !== '00' ||
+      !allZero(header.subarray(157, 257)) ||
+      !allZero(header.subarray(265, 500)) ||
+      !allZero(header.subarray(500, 512)) ||
+      parseTarOctal(header.subarray(100, 108)) !== entry.mode ||
+      parseTarOctal(header.subarray(108, 116)) !== 0 ||
+      parseTarOctal(header.subarray(116, 124)) !== 0 ||
+      parseTarOctal(header.subarray(124, 136)) !== entry.bytes.byteLength ||
+      parseTarOctal(header.subarray(136, 148)) !== 0
+    ) {
+      throw new Error('invalid tar header');
+    }
+    const checksumHeader = new Uint8Array(header);
+    checksumHeader.fill(0x20, 148, 156);
+    if (
+      parseTarOctal(header.subarray(148, 156)) !==
+      checksumHeader.reduce((total, byte) => total + byte, 0)
+    ) {
+      throw new Error('invalid tar checksum');
+    }
+    const contentStart = offset + 512;
+    const contentEnd = contentStart + entry.bytes.byteLength;
+    const paddedEnd = contentStart + Math.ceil(entry.bytes.byteLength / 512) * 512;
+    if (
+      paddedEnd > tarBytes.byteLength ||
+      !Buffer.from(tarBytes.subarray(contentStart, contentEnd)).equals(Buffer.from(entry.bytes)) ||
+      !allZero(tarBytes.subarray(contentEnd, paddedEnd))
+    ) {
+      throw new Error('invalid tar content');
+    }
+    physical.push({ path: entry.path, bytes: tarBytes.subarray(contentStart, contentEnd), mode: entry.mode });
+    offset = paddedEnd;
+  }
+  if (
+    offset + 1_024 !== tarBytes.byteLength ||
+    !allZero(tarBytes.subarray(offset, offset + 1_024))
+  ) {
+    throw new Error('invalid tar terminator');
+  }
+
+  const indexEntry = physical.find(({ path }) => path === 'verow/payload-index.json');
+  if (indexEntry !== undefined) {
+    let index: unknown;
+    try {
+      index = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(indexEntry.bytes));
+    } catch {
+      throw new Error('invalid tar payload index');
+    }
+    if (!validatePayloadIndex(index).valid) throw new Error('invalid tar payload index');
+    const declared = index as MigrationPayloadIndexV1;
+    const indexedPhysical = physical.filter(({ path }) => path !== 'verow/payload-index.json');
+    if (declared.entries.length !== indexedPhysical.length) throw new Error('invalid tar payload closure');
+    for (let indexPosition = 0; indexPosition < indexedPhysical.length; indexPosition += 1) {
+      const actual = indexedPhysical[indexPosition] as (typeof indexedPhysical)[number];
+      const claim = declared.entries[indexPosition];
+      if (
+        claim === undefined ||
+        claim.path !== actual.path ||
+        claim.bytes !== actual.bytes.byteLength ||
+        claim.mode !== actual.mode ||
+        claim.digest !== sha256(actual.bytes)
+      ) {
+        throw new Error('invalid tar payload closure');
+      }
+    }
+  }
+}
+
+async function encodePackStream(
+  entries: readonly ArchiveEntry[],
+  packFactory: TarPackFactory,
+): Promise<Uint8Array> {
+  const archive = packFactory();
+  return await new Promise<Uint8Array>((resolve, reject) => {
     const chunks: Buffer[] = [];
-    const archiveFailure = new Promise<never>((_resolve, reject) => {
-      archive.once('error', reject);
+    let settled = false;
+    let ended = false;
+    const settleReject = (): void => {
+      if (settled) return;
+      settled = true;
+      reject(new Error('archive stream failed'));
+    };
+    archive.on('data', (chunk: Buffer) => {
+      if (settled) return;
+      try {
+        chunks.push(Buffer.from(chunk));
+      } catch {
+        settleReject();
+      }
     });
-    const completion = new Promise<void>((resolve) => {
-      archive.on('data', (chunk: Buffer) => chunks.push(Buffer.from(chunk)));
-      archive.once('end', resolve);
+    archive.on('error', settleReject);
+    archive.once('aborted', settleReject);
+    archive.once('close', () => {
+      if (!ended) settleReject();
     });
-    for (const entry of entries) {
-      await Promise.race([
-        new Promise<void>((resolve, reject) => {
+    archive.once('end', () => {
+      if (settled) return;
+      ended = true;
+      settled = true;
+      resolve(new Uint8Array(Buffer.concat(chunks)));
+    });
+
+    const write = async (): Promise<void> => {
+      for (const entry of entries) {
+        await new Promise<void>((resolveEntry, rejectEntry) => {
+          if (settled) {
+            rejectEntry(new Error('archive ended early'));
+            return;
+          }
           archive.entry(
             {
               name: entry.path,
@@ -959,30 +1524,20 @@ async function encodeDeterministicArchive(
               gname: '',
             },
             entry.bytes,
-            (error) => (error ? reject(error) : resolve()),
+            (error) => (error ? rejectEntry(error) : resolveEntry()),
           );
-        }),
-        archiveFailure,
-      ]);
-    }
-    archive.finalize();
-    await Promise.race([completion, archiveFailure]);
-    const tarBytes = Buffer.concat(chunks);
-    const gzipBytes = new Uint8Array(gzipSync(tarBytes, { level: 9 }));
-    if (gzipBytes.byteLength < 10) fail('bundle_archive_failed');
-    gzipBytes[9] = 3;
-    return {
-      bytes: gzipBytes,
-      expandedBytes: tarBytes.byteLength,
+        });
+      }
+      if (settled) throw new Error('archive ended early');
+      archive.finalize();
     };
-  } catch {
-    fail('bundle_archive_failed');
-  }
+    void write().catch(settleReject);
+  });
 }
 
 export async function createDeterministicTarGzip(
   entries: readonly ArchiveEntry[],
-  packFactory: TarPackFactory = pack,
+  packFactory?: TarPackFactory,
 ): Promise<Uint8Array> {
   return (await encodeDeterministicArchive(entries, packFactory)).bytes;
 }
@@ -991,6 +1546,11 @@ export async function createMigrationBundle(
   rawInput: CreateMigrationBundleInput,
 ): Promise<CreatedMigrationBundle> {
   assertInputRoot(rawInput);
+  const reviewedIdentity = {
+    websiteId: rawInput.websiteId,
+    migrationId: rawInput.migrationId,
+    sourceDigest: rawInput.sourceDigest,
+  } as const;
   const limits = resolveArchiveLimits(rawInput.limits);
   if (BUNDLE_CAPABILITY_CLAIMS.length > limits.maxCapabilities) fail('bundle_limit_exceeded');
   assertArchiveEntries(rawInput.candidate, limits);
@@ -1025,10 +1585,11 @@ export async function createMigrationBundle(
   const candidateIdentity = candidateInventory(candidate);
   assertArtifactContracts(
     artifacts,
-    rawInput,
+    reviewedIdentity,
     candidateIdentity.digest,
     source.digest,
     candidateIdentity.digests,
+    candidate,
     editorialAssets,
   );
 
@@ -1086,7 +1647,7 @@ export async function createMigrationBundle(
   entries.sort((left, right) => compareUtf8(left.path, right.path));
   assertFinalEntries(entries, limits);
 
-  const encoded = await encodeDeterministicArchive(entries, pack);
+  const encoded = await encodeDeterministicArchive(entries);
   if (encoded.bytes.byteLength > limits.maxCompressedBytes) fail('bundle_limit_exceeded');
   if (
     encoded.bytes.byteLength === 0 ||
@@ -1097,8 +1658,8 @@ export async function createMigrationBundle(
   const artifactDigest = sha256(encoded.bytes);
   const manifest: MigrationBundleManifestV1 = {
     version: BUNDLE_FORMAT,
-    migrationId: rawInput.migrationId,
-    websiteId: rawInput.websiteId,
+    migrationId: reviewedIdentity.migrationId,
+    websiteId: reviewedIdentity.websiteId,
     sourceDigest: source.digest,
     artifactDigest,
     archiveFormat: ARCHIVE_FORMAT,

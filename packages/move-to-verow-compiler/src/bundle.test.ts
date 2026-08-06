@@ -1,7 +1,8 @@
 import { createHash } from 'node:crypto';
+import { PassThrough } from 'node:stream';
 import { gunzipSync } from 'node:zlib';
 
-import { extract, pack } from 'tar-stream';
+import { extract, pack, type Pack } from 'tar-stream';
 import { describe, expect, it } from 'vitest';
 
 import { canonicalDigest, validateBundleDescriptor, validatePayloadIndex } from './bundle-contract.js';
@@ -90,10 +91,16 @@ function input(overrides: Partial<CreateMigrationBundleInput> = {}): CreateMigra
     websiteId,
     migrationId,
     sourceDigest: built.compiled.privateManifest.sourceDigest,
-    sourceInventory,
-    candidate: baseCandidate,
+    sourceInventory: {
+      format: sourceInventory.format,
+      files: sourceInventory.files.map((file) => ({ ...file })),
+    },
+    candidate: baseCandidate.map((entry) => ({ ...entry, bytes: new Uint8Array(entry.bytes) })),
     artifacts: built.compiled,
-    editorialAssets: [{ digest: built.compiled.contentFixture.editorialAssets[0]!.digest, bytes: built.assetBytes }],
+    editorialAssets: [{
+      digest: built.compiled.contentFixture.editorialAssets[0]!.digest,
+      bytes: new Uint8Array(built.assetBytes),
+    }],
     dependencyInventory: {
       version: 'move-to-verow.dependency-inventory.v1',
       dependencies: [
@@ -129,6 +136,63 @@ interface ReadEntry {
   uname: string;
   gname: string;
   type: string;
+}
+
+interface PhysicalHeader {
+  name: string;
+  type: string;
+  checksum: number;
+  computedChecksum: number;
+}
+
+function parseOctal(field: Uint8Array): number {
+  const text = Buffer.from(field).toString('ascii').replace(/\0.*$/u, '').trim();
+  return text === '' ? 0 : Number.parseInt(text, 8);
+}
+
+function readPhysicalHeaders(bytes: Uint8Array): PhysicalHeader[] {
+  const tar = gunzipSync(bytes);
+  const headers: PhysicalHeader[] = [];
+  let offset = 0;
+  let terminalBlocks = 0;
+  while (offset + 512 <= tar.byteLength) {
+    const header = tar.subarray(offset, offset + 512);
+    if (header.every((value) => value === 0)) {
+      terminalBlocks += 1;
+      offset += 512;
+      continue;
+    }
+    expect(terminalBlocks).toBe(0);
+    const checksumHeader = Buffer.from(header);
+    checksumHeader.fill(0x20, 148, 156);
+    const nul = header.indexOf(0);
+    const nameBytes = header.subarray(0, nul === -1 || nul > 100 ? 100 : nul);
+    const size = parseOctal(header.subarray(124, 136));
+    headers.push({
+      name: new TextDecoder('utf-8', { fatal: true }).decode(nameBytes),
+      type: String.fromCharCode(header[156] ?? 0),
+      checksum: parseOctal(header.subarray(148, 156)),
+      computedChecksum: checksumHeader.reduce((total, value) => total + value, 0),
+    });
+    offset += 512 + Math.ceil(size / 512) * 512;
+  }
+  expect(offset).toBe(tar.byteLength);
+  expect(terminalBlocks).toBe(2);
+  return headers;
+}
+
+function terminalPack(kind: 'empty-end' | 'truncated-end' | 'close'): Pack {
+  const stream = new PassThrough();
+  const archive = stream as unknown as Pack;
+  archive.entry = ((_header, _bytes, callback) => {
+    callback();
+  }) as Pack['entry'];
+  archive.finalize = () => {
+    if (kind === 'truncated-end') stream.write(Buffer.alloc(512));
+    if (kind === 'close') stream.destroy();
+    else stream.end();
+  };
+  return archive;
 }
 
 async function readArchive(bytes: Uint8Array): Promise<ReadEntry[]> {
@@ -223,6 +287,25 @@ describe('deterministic migration bundle', () => {
     expect(paths.some((path) => path.includes('PaxHeader'))).toBe(false);
   });
 
+  it('writes an NFC UTF-8 path directly in one checksummed USTAR header without PAX', async () => {
+    const candidate = [
+      ...baseCandidate,
+      { path: 'public/café.txt', bytes: encoder.encode('bonjour\n'), executable: false },
+    ];
+    const result = await createMigrationBundle(
+      input({ candidate, artifacts: artifacts(candidate).compiled }),
+    );
+    const physical = readPhysicalHeaders(result.bytes);
+    const extracted = await readArchive(result.bytes);
+
+    expect(physical.map(({ name }) => name)).toEqual(extracted.map(({ path }) => path));
+    expect(physical).toHaveLength(result.payloadIndex.entries.length + 1);
+    expect(physical.find(({ name }) => name === 'candidate/public/café.txt')).toBeDefined();
+    expect(physical.some(({ type }) => ['x', 'g', 'L', 'K'].includes(type))).toBe(false);
+    expect(physical.every(({ type }) => type === '0')).toBe(true);
+    expect(physical.every(({ checksum, computedChecksum }) => checksum === computedChecksum)).toBe(true);
+  });
+
   it('indexes every other uncompressed entry exactly once and keeps the outer descriptor adjacent', async () => {
     const result = await createMigrationBundle(input());
     const entries = await readArchive(result.bytes);
@@ -290,6 +373,80 @@ describe('deterministic migration bundle', () => {
   ])('rejects cross-artifact mismatch: %s', async (_label, mutate) => {
     const invalid = structuredClone(input());
     mutate(invalid);
+    await expect(createMigrationBundle(invalid)).rejects.toThrow(/^bundle_contract_invalid$/u);
+  });
+
+  it.each([
+    ['fixture purpose', (value: CreateMigrationBundleInput) => {
+      (value.artifacts.contentFixture as { purpose: string }).purpose = 'SYNTHETIC_PRIVATE_PURPOSE';
+    }],
+    ['binding kind', (value: CreateMigrationBundleInput) => {
+      (value.artifacts.privateManifest.targets[0]!.binding as { kind: string }).kind = 'private_kind';
+    }],
+    ['binding key', (value: CreateMigrationBundleInput) => {
+      value.artifacts.privateManifest.targets[0]!.binding.key = 'private.other.key';
+    }],
+    ['protocol package', (value: CreateMigrationBundleInput) => {
+      for (const protocol of [
+        value.artifacts.privateManifest.cmsNativeProtocol,
+        value.artifacts.repositoryBinding.cmsNativeProtocol,
+        value.artifacts.runtimeExpectation.cmsNativeProtocol,
+      ]) {
+        (protocol as { package: string }).package = '@private/forged';
+      }
+    }],
+    ['numeric actions', (value: CreateMigrationBundleInput) => {
+      value.artifacts.privateManifest.targets[0]!.actions = [1, 2] as never;
+    }],
+    ['runtime strategy', (value: CreateMigrationBundleInput) => {
+      (value.artifacts.repositoryBinding.runtimeBinding as { strategy: string }).strategy = 'private_strategy';
+    }],
+    ['runtime identity version', (value: CreateMigrationBundleInput) => {
+      (value.artifacts.repositoryBinding.runtimeBinding as { identityVersion: number }).identityVersion = 2;
+    }],
+    ['negative runtime count', (value: CreateMigrationBundleInput) => {
+      value.artifacts.runtimeExpectation.counts.routes = -1;
+    }],
+    ['unused structured family', (value: CreateMigrationBundleInput) => {
+      value.artifacts.privateManifest.structuredFamilies = ['blog'];
+      value.artifacts.runtimeExpectation.counts.structuredFamilies = 1;
+    }],
+    ['collection policy on an image', (value: CreateMigrationBundleInput) => {
+      value.artifacts.privateManifest.targets[0]!.collection = {
+        minimumItems: 0,
+        maximumItems: 1,
+        requiredItemIds: [],
+      };
+    }],
+    ['image value detached from its editorial digest', (value: CreateMigrationBundleInput) => {
+      value.artifacts.contentFixture.values[0]!.value = sha256('private detached value');
+    }],
+  ])('rejects semantically forged Task 4 artifact fields: %s', async (_label, mutate) => {
+    const invalid = structuredClone(input());
+    mutate(invalid);
+    relinkArtifactDigests(invalid.artifacts);
+    try {
+      await createMigrationBundle(invalid);
+      throw new Error('expected rejection');
+    } catch (error) {
+      expect(String(error)).toBe('Error: bundle_contract_invalid');
+      expect(String(error)).not.toContain('SYNTHETIC_PRIVATE');
+    }
+  });
+
+  it('rejects a rehashed private or non-canonical external asset URL', async () => {
+    const invalid = structuredClone(input());
+    const target = invalid.artifacts.privateManifest.targets[0]!;
+    const identity = { key: target.key, locale: target.locale, variant: target.variant };
+    const privateUrl = 'https://localhost/private-image.png';
+    invalid.artifacts.contentFixture.editorialAssets = [];
+    invalid.artifacts.contentFixture.externalAssets = [{ target: identity, url: privateUrl }];
+    invalid.artifacts.contentFixture.values[0]!.value = privateUrl;
+    target.editorialAssetDigest = null;
+    target.externalBoundary = 'private-test-boundary';
+    target.externalUrl = privateUrl;
+    invalid.editorialAssets = [];
+    relinkArtifactDigests(invalid.artifacts);
     await expect(createMigrationBundle(invalid)).rejects.toThrow(/^bundle_contract_invalid$/u);
   });
 
@@ -426,7 +583,7 @@ describe('deterministic migration bundle', () => {
 
     const bombCandidate = [
       ...baseCandidate,
-      { path: 'public/zeros.txt', bytes: new Uint8Array(1_000_000), executable: false },
+      { path: 'public/repeated.txt', bytes: encoder.encode('a'.repeat(1_000_000)), executable: false },
     ];
     await expect(
       createMigrationBundle(
@@ -522,6 +679,68 @@ describe('deterministic migration bundle', () => {
     await expect(createMigrationBundle(unclosedFont)).resolves.toBeDefined();
   });
 
+  it('rejects renamed archive magic and opaque binary outside the Task 4 asset allowlist', async () => {
+    const zipBytes = new Uint8Array([0x50, 0x4b, 0x03, 0x04, 1, 2, 3, 4]);
+    const opaqueBytes = new Uint8Array([1, 2, 0, 0xff, 3, 4]);
+    for (const [path, bytes] of [
+      ['public/renamed-data.txt', zipBytes],
+      ['public/opaque-data.txt', opaqueBytes],
+    ] as const) {
+      const candidate = [...baseCandidate, { path, bytes, executable: false }];
+      await expect(
+        createMigrationBundle(input({ candidate, artifacts: artifacts(candidate).compiled })),
+      ).rejects.toThrow(/^bundle_entry_forbidden$/u);
+    }
+
+    const disguised = [...baseCandidate, {
+      path: 'public/disguised.png',
+      bytes: zipBytes,
+      executable: false,
+    }];
+    const forged = input({ candidate: disguised, artifacts: artifacts(disguised).compiled });
+    forged.artifacts.privateManifest.structuralAssets = [{
+      digest: sha256(zipBytes),
+      mime: 'image/png',
+      references: [{ id: 'disguised', sourcePath: 'public/disguised.png' }],
+    }];
+    relinkArtifactDigests(forged.artifacts);
+    await expect(createMigrationBundle(forged)).rejects.toThrow(/^bundle_entry_forbidden$/u);
+  });
+
+  it('allows inspected binary assets by Task 4 digest/mime and requires SVG structural closure', async () => {
+    const pngBytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    const binaryCandidate = [
+      ...baseCandidate,
+      { path: 'public/brand.data', bytes: pngBytes, executable: false },
+    ];
+    const allowed = input({
+      candidate: binaryCandidate,
+      artifacts: artifacts(binaryCandidate).compiled,
+    });
+    allowed.artifacts.privateManifest.structuralAssets = [{
+      digest: sha256(pngBytes),
+      mime: 'image/png',
+      references: [{ id: 'brand', sourcePath: 'public/brand.data' }],
+    }];
+    relinkArtifactDigests(allowed.artifacts);
+    await expect(createMigrationBundle(allowed)).resolves.toBeDefined();
+
+    const svgBytes = encoder.encode('<svg xmlns="http://www.w3.org/2000/svg"><path d="M0 0"/></svg>');
+    const svgCandidate = [
+      ...baseCandidate,
+      { path: 'public/decorative.svg', bytes: svgBytes, executable: false },
+    ];
+    const missing = input({ candidate: svgCandidate, artifacts: artifacts(svgCandidate).compiled });
+    await expect(createMigrationBundle(missing)).rejects.toThrow(/^bundle_contract_invalid$/u);
+    missing.artifacts.privateManifest.structuralAssets = [{
+      digest: sha256(svgBytes),
+      mime: 'image/svg+xml',
+      references: [{ id: 'decorative', sourcePath: 'public/decorative.svg' }],
+    }];
+    relinkArtifactDigests(missing.artifacts);
+    await expect(createMigrationBundle(missing)).resolves.toBeDefined();
+  });
+
   it('allows legitimate third-party HTTPS text while preserving namespace separation', async () => {
     const candidate = [
       ...baseCandidate,
@@ -575,6 +794,22 @@ describe('deterministic migration bundle', () => {
     expect(getterCalls).toBe(0);
   });
 
+  it('rejects accessor-bearing Task 4 scalar arrays without invoking the accessor', async () => {
+    let getterCalls = 0;
+    const invalid = input();
+    const families = Array(1) as CompiledMigrationArtifacts['privateManifest']['structuredFamilies'];
+    Object.defineProperty(families, 0, {
+      enumerable: true,
+      get() {
+        getterCalls += 1;
+        throw new Error('SYNTHETIC_PRIVATE_FAMILY_GETTER');
+      },
+    });
+    invalid.artifacts.privateManifest.structuredFamilies = families;
+    await expect(createMigrationBundle(invalid)).rejects.toThrow(/^bundle_input_invalid$/u);
+    expect(getterCalls).toBe(0);
+  });
+
   it('copies every admitted byte before asynchronous work', async () => {
     const mutable = input();
     const expected = await createMigrationBundle(structuredClone(mutable));
@@ -582,6 +817,62 @@ describe('deterministic migration bundle', () => {
     mutable.candidate[0]!.bytes.fill(0);
     mutable.editorialAssets[0]!.bytes.fill(0);
     expect((await promise).bytes).toEqual(expected.bytes);
+  });
+
+  it('snapshots IDs and every mutable raw input before returning the promise', async () => {
+    const expected = await createMigrationBundle(input());
+    const mutable = input();
+    const promise = createMigrationBundle(mutable);
+    mutable.websiteId = '33333333-3333-4333-8333-333333333333';
+    mutable.migrationId = '44444444-4444-4444-8444-444444444444';
+    mutable.sourceDigest = sha256('mutated source');
+    mutable.candidate.reverse();
+    mutable.candidate[0]!.bytes.fill(0);
+    mutable.sourceInventory.files.reverse();
+    mutable.sourceInventory.files[0]!.path = 'private-mutated.ts';
+    mutable.editorialAssets[0]!.bytes.fill(0);
+    mutable.dependencyInventory.dependencies.reverse();
+    mutable.evidence.reverse();
+    mutable.artifacts.contentFixture.websiteId = mutable.websiteId;
+
+    const actual = await promise;
+    expect(actual.bytes).toEqual(expected.bytes);
+    expect(actual.manifest).toEqual(expected.manifest);
+    expect(actual.payloadIndex).toEqual(expected.payloadIndex);
+  });
+
+  it('rejects proxied and revoked byte arrays without triggering proxy traps or leaking errors', async () => {
+    const secret = 'SYNTHETIC_PRIVATE_TYPED_ARRAY_TRAP';
+    let trapCalls = 0;
+    const proxied = new Proxy(new Uint8Array([1, 2, 3]), {
+      getPrototypeOf() {
+        trapCalls += 1;
+        throw new Error(secret);
+      },
+      get() {
+        trapCalls += 1;
+        throw new Error(secret);
+      },
+    });
+    const revocable = Proxy.revocable(new Uint8Array([1, 2, 3]), {});
+    revocable.revoke();
+    for (const bytes of [proxied, revocable.proxy]) {
+      const invalid = input({
+        candidate: baseCandidate.map((entry) => ({
+          ...entry,
+          bytes: new Uint8Array(entry.bytes),
+        })),
+      });
+      invalid.candidate[0]!.bytes = bytes;
+      try {
+        await createMigrationBundle(invalid);
+        throw new Error('expected rejection');
+      } catch (error) {
+        expect(String(error)).toBe('Error: bundle_input_invalid');
+        expect(String(error)).not.toContain(secret);
+      }
+    }
+    expect(trapCalls).toBe(0);
   });
 
   it('does not depend on current time, randomness or locale collation', async () => {
@@ -627,6 +918,51 @@ describe('deterministic migration bundle', () => {
       new Promise<string>((resolve) => setTimeout(() => resolve('hung'), 100)),
     ]);
 
+    expect(outcome).toBe('Error: bundle_archive_failed');
+  });
+
+  it('normalizes repeated terminal error signals without an unhandled rejection', async () => {
+    await expect(
+      createDeterministicTarGzip(
+        [{ path: 'candidate/page.txt', bytes: encoder.encode('safe'), mode: 0o644 }],
+        () => {
+          const archive = pack();
+          archive.entry = (() => {
+            queueMicrotask(() => {
+              archive.emit('error', new Error('first private error'));
+              archive.emit('error', new Error('second private error'));
+            });
+            return undefined;
+          }) as unknown as typeof archive.entry;
+          return archive;
+        },
+      ),
+    ).rejects.toThrow(/^bundle_archive_failed$/u);
+  });
+
+  it.each(['empty-end', 'truncated-end'] as const)(
+    'rejects %s archive output instead of returning a gzip success',
+    async (kind) => {
+      await expect(
+        createDeterministicTarGzip(
+          [{ path: 'candidate/page.txt', bytes: encoder.encode('safe'), mode: 0o644 }],
+          () => terminalPack(kind),
+        ),
+      ).rejects.toThrow(/^bundle_archive_failed$/u);
+    },
+  );
+
+  it('settles close-before-end archive output without hanging or partial success', async () => {
+    const outcome = await Promise.race([
+      createDeterministicTarGzip(
+        [{ path: 'candidate/page.txt', bytes: encoder.encode('safe'), mode: 0o644 }],
+        () => terminalPack('close'),
+      ).then(
+        () => 'partial-success',
+        (error: unknown) => String(error),
+      ),
+      new Promise<string>((resolve) => setTimeout(() => resolve('hung'), 100)),
+    ]);
     expect(outcome).toBe('Error: bundle_archive_failed');
   });
 

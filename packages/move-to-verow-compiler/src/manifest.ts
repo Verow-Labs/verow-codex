@@ -309,7 +309,7 @@ function isPublicIpAddress(address: string): boolean {
   return false;
 }
 
-function canonicalPublicHttpsUrl(raw: unknown): string | null {
+export function canonicalPublicHttpsUrl(raw: unknown): string | null {
   if (typeof raw !== 'string' || raw.length > MAX_STRING) return null;
   try {
     const parsed = new URL(raw);

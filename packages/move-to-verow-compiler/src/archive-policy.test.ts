@@ -65,8 +65,31 @@ describe('migration archive admission policy', () => {
     'bundle.tar.gz',
     'native/addon.node',
     'bin/program.exe',
+    '.netrc',
+    'config/secrets.json',
+    'config/api-token.txt',
+    'config/api-key.txt',
+    'config/access_token.json',
+    'config/client-secret.yaml',
+    'config/credentials.json',
+    'config/token.json',
+    'config/service-account.json',
+    'config/service_account_key.json',
+    'config/service-account-credentials.json',
   ])('rejects forbidden candidate path %s with a content-free code', (path) => {
     expect(() => assertArchiveEntries([entry(path)])).toThrow(/^bundle_entry_forbidden$/u);
+  });
+
+  it('does not confuse ordinary source names with credential material', () => {
+    expect(() =>
+      assertArchiveEntries([
+        entry('styles/design-tokens.css'),
+        entry('lib/tokenizer.ts'),
+        entry('people/secretary.ts'),
+        entry('styles/keyframes.css'),
+        entry('lib/api-client.ts'),
+      ]),
+    ).not.toThrow();
   });
 
   it('rejects normalized, case-folded, long, deep and duplicate path collisions', () => {
@@ -118,6 +141,22 @@ describe('migration archive admission policy', () => {
     }
   });
 
+  it('rejects renamed archive signatures independently of their extension', () => {
+    const tarBytes = new Uint8Array(262);
+    tarBytes.set(new TextEncoder().encode('ustar'), 257);
+    for (const [path, content] of [
+      ['renamed-zip.txt', new Uint8Array([0x50, 0x4b, 0x03, 0x04, 1, 2])],
+      ['renamed-gzip.txt', new Uint8Array([0x1f, 0x8b, 8, 0, 1, 2])],
+      ['renamed-7z.txt', new Uint8Array([0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c])],
+      ['renamed-xz.txt', new Uint8Array([0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00])],
+      ['renamed-tar.txt', tarBytes],
+    ] as const) {
+      expect(() => assertArchiveEntries([entry(path, { bytes: content })])).toThrow(
+        /^bundle_entry_forbidden$/u,
+      );
+    }
+  });
+
   it('applies entry and byte limits with safe arithmetic', () => {
     expect(() =>
       assertArchiveEntries([entry('a.ts'), entry('b.ts')], {
@@ -143,5 +182,41 @@ describe('migration archive admission policy', () => {
       entry(`f/${index.toString().padStart(3, '0')}.ts`, { bytes: new Uint8Array() }),
     );
     expect(() => assertArchiveEntries(entries)).not.toThrow();
+  });
+
+  it('rejects an over-limit array before enumerating descriptors or observed items', () => {
+    const originalDescriptors = Object.getOwnPropertyDescriptors;
+    let descriptorReads = 0;
+    let itemTraps = 0;
+    const observedItem = new Proxy(entry('private.ts'), {
+      ownKeys() {
+        itemTraps += 1;
+        throw new Error('private item trap');
+      },
+    });
+    const oversized = Array.from(
+      { length: ARCHIVE_LIMITS.maxCandidateEntries + 1 },
+      () => observedItem,
+    );
+    Object.getOwnPropertyDescriptors = ((value: object) => {
+      if (value === oversized) descriptorReads += 1;
+      return originalDescriptors(value);
+    }) as typeof Object.getOwnPropertyDescriptors;
+    try {
+      expect(() => assertArchiveEntries(oversized)).toThrow(/^bundle_limit_exceeded$/u);
+    } finally {
+      Object.getOwnPropertyDescriptors = originalDescriptors;
+    }
+    expect(descriptorReads).toBe(0);
+    expect(itemTraps).toBe(0);
+
+    const sparse = Array(ARCHIVE_LIMITS.maxCandidateEntries + 1) as BundleEntryInput[];
+    Object.defineProperty(sparse, 0, {
+      enumerable: true,
+      get() {
+        throw new Error('private accessor');
+      },
+    });
+    expect(() => assertArchiveEntries(sparse)).toThrow(/^bundle_limit_exceeded$/u);
   });
 });
