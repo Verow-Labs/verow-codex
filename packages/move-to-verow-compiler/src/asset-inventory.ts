@@ -1,0 +1,666 @@
+import { createHash } from 'node:crypto';
+import { isIP } from 'node:net';
+import { types as nodeUtilTypes } from 'node:util';
+
+import sharp, { type Metadata } from 'sharp';
+
+export type AssetDigest = `sha256:${string}`;
+
+export interface AssetTargetIdentity {
+  key: string;
+  locale: string | null;
+  variant: string | null;
+}
+
+export interface AssetReference {
+  id: string;
+  sourcePath: string;
+  target?: AssetTargetIdentity;
+}
+
+export interface CaptureReceiptV1 {
+  policyVersion: 'move-to-verow.capture-receipt.v1';
+  originalUrl: string;
+  finalUrl: string;
+  redirects: string[];
+  resolvedAddresses: Array<{ host: string; address: string; public: true }>;
+  cookiesStripped: true;
+  authorizationStripped: true;
+  byteLimit: number;
+  byteCount: number;
+  sniffedMime: string;
+  digest: AssetDigest;
+}
+
+export interface StructuralFontLicense {
+  spdxId: 'OFL-1.1' | 'Apache-2.0' | 'MIT' | 'BSD-3-Clause';
+  notice: string;
+}
+
+interface ByteAssetInput {
+  classification: 'editorial_cms' | 'structural_git';
+  reference: AssetReference;
+  bytes: Uint8Array;
+  digest: AssetDigest;
+  structuralKind?: 'font' | 'image';
+  fontLicense?: StructuralFontLicense;
+}
+
+export interface SourceLocalAssetInput extends ByteAssetInput {
+  authority: 'source_local';
+}
+
+export interface HostedSourceCaptureAssetInput extends ByteAssetInput {
+  authority: 'hosted_source_capture';
+  captureReceipt: CaptureReceiptV1;
+}
+
+export interface DeclaredExternalAssetInput {
+  authority: 'declared_external';
+  classification: 'declared_external';
+  reference: AssetReference & { target: AssetTargetIdentity };
+  externalUrl: string;
+  privateBoundary: string;
+}
+
+export type AssetInput = SourceLocalAssetInput | HostedSourceCaptureAssetInput | DeclaredExternalAssetInput;
+
+export interface AssetInventoryLimits {
+  maxAssets: number;
+  maxSingleBytes: number;
+  maxTotalBytes: number;
+  maxPixels: number;
+  maxDimension: number;
+  maxSvgBytes: number;
+  maxFrames: number;
+  maxFonts: number;
+  maxFontBytes: number;
+  maxReferences: number;
+  maxBlockers: number;
+}
+
+export type AssetInventoryBlockerCode =
+  | 'asset_authority_conflict'
+  | 'asset_digest_mismatch'
+  | 'asset_input_invalid'
+  | 'asset_limit_invalid'
+  | 'asset_policy_blocked'
+  | 'asset_target_conflict'
+  | 'capture_receipt_invalid'
+  | 'external_url_invalid';
+
+export interface AssetInventoryBlocker {
+  code: AssetInventoryBlockerCode;
+}
+
+export type AssetProvenance =
+  | { authority: 'source_local'; sourcePath: string }
+  | {
+      authority: 'hosted_source_capture';
+      sourcePath: string;
+      receiptPolicyVersion: 'move-to-verow.capture-receipt.v1';
+      originalUrl: string;
+      finalUrl: string;
+    };
+
+export interface InventoriedAssetReference extends AssetReference {
+  classification: 'editorial_cms' | 'structural_git';
+  provenance: AssetProvenance;
+}
+
+export interface InventoriedAsset {
+  digest: AssetDigest;
+  bytes: number;
+  bytesValue: Uint8Array;
+  mime: string;
+  encodedWidth: number;
+  encodedHeight: number;
+  renderedWidth: number;
+  renderedHeight: number;
+  pageCount: number;
+  animated: boolean;
+  sanitizerPolicy?: { version: 'move-to-verow.svg-safety.v1'; digest: AssetDigest };
+  fontLicense?: StructuralFontLicense;
+  references: InventoriedAssetReference[];
+}
+
+export interface DeclaredExternalAsset {
+  url: string;
+  privateBoundary: string;
+  reference: AssetReference & { target: AssetTargetIdentity };
+  provenance: { authority: 'declared_external'; url: string; privateBoundary: string };
+}
+
+export interface AssetInventoryResult {
+  status: 'ready' | 'needs_attention';
+  bundled: InventoriedAsset[];
+  structural: InventoriedAsset[];
+  external: DeclaredExternalAsset[];
+  blockers: AssetInventoryBlocker[];
+}
+
+export interface AssetInventoryInput {
+  assets: AssetInput[];
+  limits?: Partial<AssetInventoryLimits>;
+}
+
+const DEFAULT_LIMITS: Readonly<AssetInventoryLimits> = {
+  maxAssets: 500,
+  maxSingleBytes: 20_000_000,
+  maxTotalBytes: 100_000_000,
+  maxPixels: 40_000_000,
+  maxDimension: 16_384,
+  maxSvgBytes: 1_000_000,
+  maxFrames: 256,
+  maxFonts: 32,
+  maxFontBytes: 10_000_000,
+  maxReferences: 2_000,
+  maxBlockers: 100,
+};
+
+const SVG_POLICY_VERSION = 'move-to-verow.svg-safety.v1' as const;
+const SHA256_PATTERN = /^sha256:[0-9a-f]{64}$/;
+const MIME_BY_FORMAT: Readonly<Record<string, string>> = {
+  avif: 'image/avif',
+  gif: 'image/gif',
+  jpeg: 'image/jpeg',
+  png: 'image/png',
+  svg: 'image/svg+xml',
+  webp: 'image/webp',
+};
+
+function digestBytes(bytes: Uint8Array): AssetDigest {
+  return `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
+}
+
+function contentFreeResult(code: AssetInventoryBlockerCode): AssetInventoryResult {
+  return { status: 'needs_attention', bundled: [], structural: [], external: [], blockers: [{ code }] };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value) || nodeUtilTypes.isProxy(value) || Object.getPrototypeOf(value) !== Object.prototype || Object.getOwnPropertySymbols(value).length > 0) return false;
+  return Object.values(Object.getOwnPropertyDescriptors(value)).every((descriptor) => descriptor.enumerable && descriptor.get === undefined && descriptor.set === undefined);
+}
+
+function isPlainArray(value: unknown): value is unknown[] {
+  if (!Array.isArray(value) || nodeUtilTypes.isProxy(value) || Object.getPrototypeOf(value) !== Array.prototype || Object.getOwnPropertySymbols(value).length > 0) return false;
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  const keys = Object.keys(descriptors).filter((key) => key !== 'length');
+  return keys.length === value.length && keys.every((key) => descriptors[key]?.enumerable && descriptors[key]?.get === undefined && descriptors[key]?.set === undefined);
+}
+
+function exactKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
+  const actual = Object.keys(value).sort();
+  const sortedExpected = [...expected].sort();
+  return actual.length === sortedExpected.length && actual.every((key, index) => key === sortedExpected[index]);
+}
+
+function resolveLimits(overrides: Partial<AssetInventoryLimits> | undefined): AssetInventoryLimits | null {
+  if (overrides === undefined) return { ...DEFAULT_LIMITS };
+  if (!isRecord(overrides)) return null;
+  const known = new Set(Object.keys(DEFAULT_LIMITS));
+  for (const [key, value] of Object.entries(overrides)) {
+    const maximum = DEFAULT_LIMITS[key as keyof AssetInventoryLimits];
+    if (!known.has(key) || !Number.isSafeInteger(value) || value <= 0 || value > maximum) return null;
+  }
+  return { ...DEFAULT_LIMITS, ...overrides };
+}
+
+function hasControlCharacters(value: string): boolean {
+  for (const character of value) {
+    const codePoint = character.codePointAt(0) ?? 0;
+    if (codePoint <= 0x1f || codePoint === 0x7f) return true;
+  }
+  return false;
+}
+
+function safePath(value: string): boolean {
+  if (!value || value !== value.normalize('NFC') || value.startsWith('/') || value.includes('\\') || hasControlCharacters(value)) return false;
+  const parts = value.split('/');
+  return parts.every((part) => part.length > 0 && part !== '.' && part !== '..');
+}
+
+function safeToken(value: string | null | undefined): boolean {
+  return value === null || (typeof value === 'string' && value.length > 0 && value.length <= 500 && value === value.normalize('NFC') && !hasControlCharacters(value));
+}
+
+function validTarget(target: AssetTargetIdentity | undefined): target is AssetTargetIdentity {
+  if (!isRecord(target) || !exactKeys(target, ['key', 'locale', 'variant']) || !safeToken(target.key) || typeof target.key !== 'string') return false;
+  return safeToken(target.locale) && safeToken(target.variant);
+}
+
+function targetKey(target: AssetTargetIdentity): string {
+  return JSON.stringify([target.key, target.locale, target.variant]);
+}
+
+function referenceKey(reference: AssetReference): string {
+  return JSON.stringify([reference.id, reference.sourcePath, reference.target === undefined ? null : targetKey(reference.target)]);
+}
+
+function validReference(reference: AssetReference): boolean {
+  if (!isRecord(reference) || !exactKeys(reference, reference.target === undefined ? ['id', 'sourcePath'] : ['id', 'sourcePath', 'target'])) return false;
+  return safeToken(reference.id) && typeof reference.id === 'string' && safePath(reference.sourcePath) && (reference.target === undefined || validTarget(reference.target));
+}
+
+function validFontLicense(value: unknown): value is StructuralFontLicense {
+  return isRecord(value) && exactKeys(value, ['notice', 'spdxId']) &&
+    ['OFL-1.1', 'Apache-2.0', 'MIT', 'BSD-3-Clause'].includes(value.spdxId as string) && typeof value.notice === 'string' && safeToken(value.notice);
+}
+
+function validAssetInput(value: unknown): value is AssetInput {
+  if (!isRecord(value)) return false;
+  if (value.authority === 'declared_external') {
+    return exactKeys(value, ['authority', 'classification', 'externalUrl', 'privateBoundary', 'reference']) &&
+      value.classification === 'declared_external' && validReference(value.reference as AssetReference) &&
+      typeof value.externalUrl === 'string' && typeof value.privateBoundary === 'string';
+  }
+  if (value.authority !== 'source_local' && value.authority !== 'hosted_source_capture') return false;
+  const optional = [
+    ...(Object.hasOwn(value, 'structuralKind') ? ['structuralKind'] : []),
+    ...(Object.hasOwn(value, 'fontLicense') ? ['fontLicense'] : []),
+    ...(Object.hasOwn(value, 'captureReceipt') ? ['captureReceipt'] : []),
+  ];
+  if (!exactKeys(value, ['authority', 'bytes', 'classification', 'digest', 'reference', ...optional])) return false;
+  if (!['editorial_cms', 'structural_git'].includes(value.classification as string) || !validReference(value.reference as AssetReference) ||
+      !(value.bytes instanceof Uint8Array) || nodeUtilTypes.isProxy(value.bytes) || typeof value.digest !== 'string' ||
+      (value.structuralKind !== undefined && !['font', 'image'].includes(value.structuralKind as string)) ||
+      (value.fontLicense !== undefined && !validFontLicense(value.fontLicense))) return false;
+  return value.authority === 'source_local' ? !Object.hasOwn(value, 'captureReceipt') : value.captureReceipt === undefined || isRecord(value.captureReceipt);
+}
+
+function isPublicIpAddress(address: string): boolean {
+  const normalized = address.toLowerCase().replace(/^\[|\]$/gu, '');
+  const version = isIP(normalized);
+  if (version === 4) {
+    const octets = normalized.split('.').map(Number);
+    const [a, b] = octets;
+    if (a === undefined || b === undefined) return false;
+    return !(
+      a === 0 || a === 10 || a === 127 || a >= 224 ||
+      (a === 100 && b >= 64 && b <= 127) ||
+      (a === 169 && b === 254) ||
+      (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && (b === 0 || b === 168)) ||
+      (a === 198 && (b === 18 || b === 19 || b === 51)) ||
+      (a === 203 && b === 0)
+    );
+  }
+  if (version === 6) {
+    return /^[23]/u.test(normalized) && !normalized.startsWith('2001:db8:') && !normalized.startsWith('2001:0db8:');
+  }
+  return false;
+}
+
+function canonicalHttpsUrl(raw: string): string | null {
+  try {
+    const parsed = new URL(raw);
+    if (parsed.protocol !== 'https:' || parsed.username || parsed.password || parsed.hash || parsed.port) return null;
+    const hostname = parsed.hostname.toLowerCase();
+    if (hostname === 'localhost' || hostname.endsWith('.localhost')) return null;
+    if (isIP(hostname.replace(/^\[|\]$/gu, '')) !== 0 && !isPublicIpAddress(hostname)) return null;
+    parsed.hostname = hostname;
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+}
+
+function exactObjectKeys(value: object, keys: readonly string[]): boolean {
+  const actual = Object.keys(value).sort();
+  return actual.length === keys.length && actual.every((key, index) => key === [...keys].sort()[index]);
+}
+
+function validCaptureReceipt(receipt: unknown, bytes: Uint8Array, digest: AssetDigest, mime: string, limits: AssetInventoryLimits): receipt is CaptureReceiptV1 {
+  if (!isRecord(receipt) || !exactObjectKeys(receipt, [
+    'authorizationStripped', 'byteCount', 'byteLimit', 'cookiesStripped', 'digest', 'finalUrl', 'originalUrl',
+    'policyVersion', 'redirects', 'resolvedAddresses', 'sniffedMime',
+  ])) return false;
+  const candidate = receipt as Record<string, unknown>;
+  if (candidate.policyVersion !== 'move-to-verow.capture-receipt.v1' || candidate.cookiesStripped !== true || candidate.authorizationStripped !== true) return false;
+  if (!Number.isSafeInteger(candidate.byteLimit) || !Number.isSafeInteger(candidate.byteCount) || (candidate.byteLimit as number) <= 0 || (candidate.byteLimit as number) > limits.maxSingleBytes) return false;
+  if (candidate.byteCount !== bytes.byteLength || (candidate.byteLimit as number) < bytes.byteLength || candidate.digest !== digest || candidate.sniffedMime !== mime) return false;
+  if (!isPlainArray(candidate.redirects) || candidate.redirects.length > 32 || !candidate.redirects.every((url) => typeof url === 'string')) return false;
+  const urls = [candidate.originalUrl, ...candidate.redirects, candidate.finalUrl];
+  if (!urls.every((url) => typeof url === 'string')) return false;
+  const canonical = urls.map((url) => canonicalHttpsUrl(url as string));
+  if (canonical.some((url, index) => url === null || url !== urls[index])) return false;
+  const hosts = canonical.map((url) => new URL(url as string).hostname);
+  if (!hosts.every((host) => host === hosts[0])) return false;
+  if (!isPlainArray(candidate.resolvedAddresses) || candidate.resolvedAddresses.length === 0 || candidate.resolvedAddresses.length > 128) return false;
+  const receipts = candidate.resolvedAddresses;
+  if (!receipts.every((entry) => {
+    if (!isRecord(entry) || !exactObjectKeys(entry, ['address', 'host', 'public'])) return false;
+    const resolved = entry as Record<string, unknown>;
+    return resolved.public === true && typeof resolved.host === 'string' && hosts.includes(resolved.host) && typeof resolved.address === 'string' && isPublicIpAddress(resolved.address);
+  })) return false;
+  return [...new Set(hosts)].every((host) => receipts.some((entry) => (entry as { host?: unknown }).host === host));
+}
+
+function looksLikeSvg(bytes: Uint8Array): boolean {
+  const prefix = new TextDecoder('utf-8', { fatal: false }).decode(bytes.subarray(0, Math.min(bytes.byteLength, 256))).trimStart();
+  return prefix.startsWith('<svg') || prefix.startsWith('<?xml');
+}
+
+interface SvgElementFrame { id?: string; tag: string }
+
+function validateSafeSvg(bytes: Uint8Array, limits: AssetInventoryLimits): boolean {
+  if (bytes.byteLength > limits.maxSvgBytes) return false;
+  let source: string;
+  try {
+    source = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  } catch {
+    return false;
+  }
+  if (hasControlCharacters(source) || /<!DOCTYPE|<!ENTITY|<!\[CDATA|<!--|<\?(?!xml\s)|&/iu.test(source)) return false;
+  if (/<\s*(?:script|foreignObject|style|animate|animateMotion|animateTransform|set|filter|fe\w+|image|audio|video|iframe|object|embed|link|meta)\b/iu.test(source)) return false;
+  if (/\son[a-z][\w:-]*\s*=|\sstyle\s*=|@import|url\s*\(/iu.test(source)) return false;
+  const allowedTags = new Set(['svg', 'g', 'defs', 'symbol', 'use', 'rect', 'circle', 'ellipse', 'line', 'polyline', 'polygon', 'path', 'title', 'desc']);
+  const allowedAttributes = new Set([
+    'xmlns', 'xmlns:xlink', 'id', 'href', 'xlink:href', 'width', 'height', 'viewbox', 'x', 'y', 'x1', 'x2', 'y1', 'y2',
+    'cx', 'cy', 'r', 'rx', 'ry', 'd', 'points', 'fill', 'fill-rule', 'stroke', 'stroke-width', 'stroke-linecap',
+    'stroke-linejoin', 'opacity', 'transform', 'preserveaspectratio', 'role', 'aria-label',
+  ]);
+  const stack: SvgElementFrame[] = [];
+  const ids = new Set<string>();
+  const edges = new Map<string, Set<string>>();
+  const referenced = new Set<string>();
+  const tokenPattern = /<\s*(\/?)\s*([A-Za-z][\w:-]*)([^<>]*?)(\/?)\s*>/gu;
+  let lastIndex = 0;
+  let rootSeen = false;
+  let referenceCount = 0;
+  let match: RegExpExecArray | null;
+  while ((match = tokenPattern.exec(source)) !== null) {
+    const between = source.slice(lastIndex, match.index);
+    if (/[<>]/u.test(between)) return false;
+    lastIndex = tokenPattern.lastIndex;
+    const closing = match[1] === '/';
+    const tag = (match[2] ?? '').toLowerCase();
+    if (!allowedTags.has(tag)) return false;
+    if (closing) {
+      if ((match[3] ?? '').trim() || match[4] === '/' || stack.at(-1)?.tag !== tag) return false;
+      stack.pop();
+      continue;
+    }
+    if (!rootSeen) {
+      if (tag !== 'svg') return false;
+      rootSeen = true;
+    }
+    const rawAttributes = match[3] ?? '';
+    const attributes = new Map<string, string>();
+    const attributePattern = /([A-Za-z_:][\w:.-]*)\s*=\s*(?:"([^"]*)"|'([^']*)')/gu;
+    let attributeCursor = 0;
+    let attribute: RegExpExecArray | null;
+    while ((attribute = attributePattern.exec(rawAttributes)) !== null) {
+      if (rawAttributes.slice(attributeCursor, attribute.index).trim()) return false;
+      attributeCursor = attributePattern.lastIndex;
+      const name = (attribute[1] ?? '').toLowerCase();
+      const value = attribute[2] ?? attribute[3] ?? '';
+      if (!allowedAttributes.has(name) || attributes.has(name) || hasControlCharacters(value)) return false;
+      attributes.set(name, value);
+    }
+    if (rawAttributes.slice(attributeCursor).trim()) return false;
+    const id = attributes.get('id');
+    if (id !== undefined) {
+      if (!/^[A-Za-z_][\w.-]{0,127}$/u.test(id) || ids.has(id)) return false;
+      ids.add(id);
+    }
+    for (const name of ['href', 'xlink:href']) {
+      const href = attributes.get(name);
+      if (href === undefined) continue;
+      referenceCount += 1;
+      if (referenceCount > limits.maxReferences) return false;
+      if (!/^#[A-Za-z_][\w.-]{0,127}$/u.test(href)) return false;
+      const target = href.slice(1);
+      referenced.add(target);
+      const owner = id ?? [...stack].reverse().find((frame) => frame.id !== undefined)?.id;
+      if (owner !== undefined) {
+        const outgoing = edges.get(owner) ?? new Set<string>();
+        outgoing.add(target);
+        edges.set(owner, outgoing);
+      }
+    }
+    if (match[4] !== '/') {
+      stack.push({ tag, ...(id === undefined ? {} : { id }) });
+      if (stack.length > 256) return false;
+    }
+  }
+  if (!rootSeen || stack.length > 0 || /[<>]/u.test(source.slice(lastIndex)) || [...referenced].some((id) => !ids.has(id))) return false;
+  const visiting = new Set<string>();
+  const visited = new Set<string>();
+  const cyclic = (node: string): boolean => {
+    if (visiting.has(node)) return true;
+    if (visited.has(node)) return false;
+    visiting.add(node);
+    for (const next of edges.get(node) ?? []) if (cyclic(next)) return true;
+    visiting.delete(node);
+    visited.add(node);
+    return false;
+  };
+  return ![...ids].some(cyclic);
+}
+
+function validRasterContainer(bytes: Uint8Array): boolean {
+  const buffer = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  if (buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) {
+    let offset = 8;
+    let ended = false;
+    while (offset + 12 <= buffer.length) {
+      const length = buffer.readUInt32BE(offset);
+      if (length > buffer.length - offset - 12) return false;
+      const type = buffer.toString('ascii', offset + 4, offset + 8);
+      offset += 12 + length;
+      if (type === 'IEND') { ended = true; break; }
+    }
+    return ended && offset === buffer.length;
+  }
+  if (buffer[0] === 0xff && buffer[1] === 0xd8) return buffer.at(-2) === 0xff && buffer.at(-1) === 0xd9;
+  const signature = buffer.toString('ascii', 0, 6);
+  if (signature === 'GIF87a' || signature === 'GIF89a') return buffer.at(-1) === 0x3b;
+  if (buffer.toString('ascii', 0, 4) === 'RIFF' && buffer.toString('ascii', 8, 12) === 'WEBP') return buffer.length >= 12 && buffer.readUInt32LE(4) + 8 === buffer.length;
+  return buffer.length >= 16 && buffer.toString('ascii', 4, 8) === 'ftyp' && /avif|avis/u.test(buffer.toString('ascii', 8, 16));
+}
+
+function inspectFont(bytes: Uint8Array, license: StructuralFontLicense | undefined, limits: AssetInventoryLimits): { mime: string } | null {
+  if (license === undefined || !['OFL-1.1', 'Apache-2.0', 'MIT', 'BSD-3-Clause'].includes(license.spdxId) || !safeToken(license.notice)) return null;
+  if (bytes.byteLength > limits.maxFontBytes) return null;
+  const buffer = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const signature = buffer.toString('ascii', 0, 4);
+  if (signature === 'wOFF') {
+    if (buffer.length < 64 || buffer.readUInt32BE(8) !== buffer.length || buffer.readUInt16BE(12) < 1 || buffer.readUInt16BE(12) > 64 || buffer.readUInt16BE(14) !== 0) return null;
+    const count = buffer.readUInt16BE(12);
+    if (44 + count * 20 > buffer.length) return null;
+    for (let index = 0; index < count; index += 1) {
+      const offset = 44 + index * 20;
+      const dataOffset = buffer.readUInt32BE(offset + 4);
+      const compressed = buffer.readUInt32BE(offset + 8);
+      const original = buffer.readUInt32BE(offset + 12);
+      if (dataOffset % 4 !== 0 || compressed === 0 || original === 0 || compressed > original || dataOffset > buffer.length - compressed) return null;
+    }
+    return { mime: 'font/woff' };
+  }
+  if (signature === 'wOF2') {
+    if (buffer.length < 48 || buffer.readUInt32BE(8) !== buffer.length || buffer.readUInt16BE(12) < 1 || buffer.readUInt16BE(12) > 64 || buffer.readUInt16BE(14) !== 0) return null;
+    return { mime: 'font/woff2' };
+  }
+  return null;
+}
+
+async function inspectImage(bytes: Uint8Array, limits: AssetInventoryLimits): Promise<Omit<InventoriedAsset, 'digest' | 'bytes' | 'bytesValue' | 'references'> | null> {
+  const svg = looksLikeSvg(bytes);
+  if (svg ? !validateSafeSvg(bytes, limits) : !validRasterContainer(bytes)) return null;
+  try {
+    const metadata: Metadata = await sharp(bytes, { animated: true, failOn: 'error', limitInputPixels: limits.maxPixels, sequentialRead: true }).metadata();
+    const format = metadata.format;
+    const mime = format === undefined ? undefined : MIME_BY_FORMAT[format];
+    const encodedWidth = metadata.width;
+    const encodedHeight = metadata.pageHeight ?? metadata.height;
+    const pageCount = metadata.pages ?? 1;
+    const renderedWidth = metadata.autoOrient.width;
+    const renderedHeight = pageCount > 1 && metadata.pageHeight !== undefined ? metadata.pageHeight : metadata.autoOrient.height;
+    const numbers = [encodedWidth, encodedHeight, pageCount, renderedWidth, renderedHeight];
+    if (mime === undefined || numbers.some((value) => !Number.isSafeInteger(value) || (value as number) < 0)) return null;
+    if ((encodedWidth as number) === 0 || (encodedHeight as number) === 0 || (renderedWidth as number) === 0 || (renderedHeight as number) === 0) return null;
+    if ((encodedWidth as number) > limits.maxDimension || (encodedHeight as number) > limits.maxDimension || (renderedWidth as number) > limits.maxDimension || (renderedHeight as number) > limits.maxDimension) return null;
+    if ((renderedWidth as number) * (renderedHeight as number) > limits.maxPixels || pageCount > limits.maxFrames) return null;
+    return {
+      mime,
+      encodedWidth: encodedWidth as number,
+      encodedHeight: encodedHeight as number,
+      renderedWidth: renderedWidth as number,
+      renderedHeight: renderedHeight as number,
+      pageCount,
+      animated: pageCount > 1,
+      ...(svg ? { sanitizerPolicy: { version: SVG_POLICY_VERSION, digest: digestBytes(Buffer.from(SVG_POLICY_VERSION)) } } : {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function compareReferences(left: InventoriedAssetReference, right: InventoriedAssetReference): number {
+  return compareUtf8(JSON.stringify([left.sourcePath, left.id, left.target ?? null, left.provenance]), JSON.stringify([right.sourcePath, right.id, right.target ?? null, right.provenance]));
+}
+
+function compareUtf8(left: string, right: string): number {
+  return Buffer.from(left, 'utf8').compare(Buffer.from(right, 'utf8'));
+}
+
+function sortInput(left: AssetInput, right: AssetInput): number {
+  return compareUtf8(JSON.stringify([left.reference.sourcePath, left.reference.id, left.reference.target ?? null, left.authority, left.classification]),
+    JSON.stringify([right.reference.sourcePath, right.reference.id, right.reference.target ?? null, right.authority, right.classification]),
+  );
+}
+
+export async function inventoryMigrationAssets(input: AssetInventoryInput): Promise<AssetInventoryResult> {
+  if (!isRecord(input) || !exactKeys(input, input.limits === undefined ? ['assets'] : ['assets', 'limits']) || !isPlainArray(input.assets) || input.assets.some((asset) => !validAssetInput(asset))) {
+    return contentFreeResult('asset_input_invalid');
+  }
+  const limits = resolveLimits(input.limits);
+  if (limits === null) return contentFreeResult('asset_limit_invalid');
+  if (!Array.isArray(input.assets)) return contentFreeResult('asset_input_invalid');
+  const blockerCodes = new Set<AssetInventoryBlockerCode>();
+  const block = (code: AssetInventoryBlockerCode): void => {
+    if (blockerCodes.size < limits.maxBlockers) blockerCodes.add(code);
+  };
+  if (input.assets.length > limits.maxAssets || input.assets.length > limits.maxReferences) block('asset_policy_blocked');
+  let attemptedBytes = 0;
+  for (const asset of input.assets) {
+    if (asset.authority !== 'declared_external' && asset.bytes instanceof Uint8Array) attemptedBytes += asset.bytes.byteLength;
+    if (!Number.isSafeInteger(attemptedBytes) || attemptedBytes > limits.maxTotalBytes) block('asset_policy_blocked');
+  }
+
+  const bundled = new Map<string, InventoriedAsset>();
+  const structural = new Map<string, InventoriedAsset>();
+  const external: DeclaredExternalAsset[] = [];
+  const targetOwners = new Map<string, 'editorial_cms' | 'structural_git' | 'declared_external'>();
+  const referenceOwners = new Map<string, { authority: AssetInput['authority']; classification: AssetInput['classification']; digest?: AssetDigest }>();
+  const sourceOwners = new Map<string, string>();
+  const groupAuthorities = new Map<string, AssetInput['authority']>();
+  let fontCount = 0;
+
+  for (const asset of [...input.assets].sort(sortInput)) {
+    if (!validReference(asset.reference)) { block('asset_input_invalid'); continue; }
+    const refKey = referenceKey(asset.reference);
+    const previousReference = referenceOwners.get(refKey);
+    const currentDigest = asset.authority === 'declared_external' ? undefined : asset.digest;
+    if (previousReference !== undefined && (previousReference.authority !== asset.authority || previousReference.classification !== asset.classification || previousReference.digest !== currentDigest)) {
+      block('asset_authority_conflict');
+      continue;
+    }
+    referenceOwners.set(refKey, { authority: asset.authority, classification: asset.classification, ...(currentDigest === undefined ? {} : { digest: currentDigest }) });
+
+    if (asset.authority === 'declared_external') {
+      const url = canonicalHttpsUrl(asset.externalUrl);
+      if (url === null) { block('external_url_invalid'); continue; }
+      if (!safeToken(asset.privateBoundary) || !validTarget(asset.reference.target)) { block('asset_input_invalid'); continue; }
+      const sourceOwner = `${asset.authority}:${asset.classification}:${url}:${asset.privateBoundary}`;
+      const previousSourceOwner = sourceOwners.get(asset.reference.sourcePath);
+      if (previousSourceOwner !== undefined && previousSourceOwner !== sourceOwner) { block('asset_authority_conflict'); continue; }
+      sourceOwners.set(asset.reference.sourcePath, sourceOwner);
+      const identity = targetKey(asset.reference.target);
+      if (targetOwners.has(identity)) { block('asset_target_conflict'); continue; }
+      targetOwners.set(identity, 'declared_external');
+      external.push({
+        url,
+        privateBoundary: asset.privateBoundary,
+        reference: asset.reference,
+        provenance: { authority: 'declared_external', url, privateBoundary: asset.privateBoundary },
+      });
+      continue;
+    }
+
+    if (!(asset.bytes instanceof Uint8Array) || asset.bytes.byteLength === 0 || !SHA256_PATTERN.test(asset.digest)) { block('asset_input_invalid'); continue; }
+    if (asset.bytes.byteLength > limits.maxSingleBytes) { block('asset_policy_blocked'); continue; }
+    const actualDigest = digestBytes(asset.bytes);
+    if (actualDigest !== asset.digest) { block('asset_digest_mismatch'); continue; }
+    const sourceOwner = `${asset.authority}:${asset.classification}:${actualDigest}`;
+    const previousSourceOwner = sourceOwners.get(asset.reference.sourcePath);
+    if (previousSourceOwner !== undefined && previousSourceOwner !== sourceOwner) { block('asset_authority_conflict'); continue; }
+    sourceOwners.set(asset.reference.sourcePath, sourceOwner);
+    if (asset.classification === 'editorial_cms' ? !validTarget(asset.reference.target) : asset.reference.target !== undefined) {
+      block('asset_authority_conflict');
+      continue;
+    }
+    if (asset.reference.target !== undefined) {
+      const identity = targetKey(asset.reference.target);
+      const previousOwner = targetOwners.get(identity);
+      if (previousOwner !== undefined) { block(previousOwner === asset.classification ? 'asset_target_conflict' : 'asset_authority_conflict'); continue; }
+      targetOwners.set(identity, asset.classification);
+    }
+    const groupKey = `${asset.classification}:${actualDigest}`;
+    const previousAuthority = groupAuthorities.get(groupKey);
+    if (previousAuthority !== undefined && previousAuthority !== asset.authority) { block('asset_authority_conflict'); continue; }
+    groupAuthorities.set(groupKey, asset.authority);
+
+    const font = asset.structuralKind === 'font' || Buffer.from(asset.bytes.buffer, asset.bytes.byteOffset, Math.min(asset.bytes.byteLength, 4)).toString('ascii').startsWith('wOF');
+    let inspected: Omit<InventoriedAsset, 'digest' | 'bytes' | 'bytesValue' | 'references'> | null;
+    if (font) {
+      fontCount += 1;
+      const fontMetadata = asset.classification === 'structural_git' ? inspectFont(asset.bytes, asset.fontLicense, limits) : null;
+      inspected = fontMetadata === null ? null : {
+        mime: fontMetadata.mime,
+        encodedWidth: 0,
+        encodedHeight: 0,
+        renderedWidth: 0,
+        renderedHeight: 0,
+        pageCount: 0,
+        animated: false,
+        fontLicense: asset.fontLicense as StructuralFontLicense,
+      };
+    } else {
+      inspected = await inspectImage(asset.bytes, limits);
+    }
+    if (fontCount > limits.maxFonts || inspected === null) { block('asset_policy_blocked'); continue; }
+    if (asset.authority === 'hosted_source_capture' && !validCaptureReceipt(asset.captureReceipt, asset.bytes, actualDigest, inspected.mime, limits)) {
+      block('capture_receipt_invalid');
+      continue;
+    }
+    const provenance: AssetProvenance = asset.authority === 'source_local'
+      ? { authority: 'source_local', sourcePath: asset.reference.sourcePath }
+      : {
+          authority: 'hosted_source_capture', sourcePath: asset.reference.sourcePath,
+          receiptPolicyVersion: asset.captureReceipt.policyVersion,
+          originalUrl: asset.captureReceipt.originalUrl,
+          finalUrl: asset.captureReceipt.finalUrl,
+        };
+    const reference: InventoriedAssetReference = { ...asset.reference, classification: asset.classification, provenance };
+    const destination = asset.classification === 'editorial_cms' ? bundled : structural;
+    const existing = destination.get(actualDigest);
+    if (existing === undefined) {
+      destination.set(actualDigest, { digest: actualDigest, bytes: asset.bytes.byteLength, bytesValue: asset.bytes, ...inspected, references: [reference] });
+    } else if (!existing.references.some((item) => referenceKey(item) === referenceKey(reference))) {
+      existing.references.push(reference);
+    }
+  }
+
+  const sortedAssets = (values: Iterable<InventoriedAsset>): InventoriedAsset[] => [...values].map((asset) => ({ ...asset, references: [...asset.references].sort(compareReferences) })).sort((left, right) => compareUtf8(left.digest, right.digest));
+  external.sort((left, right) => compareUtf8(JSON.stringify([left.reference.target, left.url, left.privateBoundary]), JSON.stringify([right.reference.target, right.url, right.privateBoundary])));
+  const blockers = [...blockerCodes].sort().map((code) => ({ code }));
+  return {
+    status: blockers.length === 0 ? 'ready' : 'needs_attention',
+    bundled: sortedAssets(bundled.values()),
+    structural: sortedAssets(structural.values()),
+    external,
+    blockers,
+  };
+}
