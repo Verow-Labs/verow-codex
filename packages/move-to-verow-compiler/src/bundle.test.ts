@@ -991,6 +991,81 @@ describe('deterministic migration bundle', () => {
     await expect(createMigrationBundle(missing)).resolves.toBeDefined();
   });
 
+  it('requires exact structural closure for a renamed whole-document SVG', async () => {
+    const svgBytes = encoder.encode(
+      '\uFEFF<?xml version="1.0" encoding="UTF-8"?>\n<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"><rect width="1" height="1"/></svg>',
+    );
+    const structuralPath = 'public/renamed-vector.data';
+    const candidate = [...baseCandidate, { path: structuralPath, bytes: svgBytes, executable: false }];
+    const missing = input({ candidate, artifacts: artifacts(candidate).compiled });
+    await expect(createMigrationBundle(missing)).rejects.toThrow(/^bundle_contract_invalid$/u);
+
+    missing.artifacts.privateManifest.structuralAssets = [{
+      digest: sha256(svgBytes),
+      mime: 'image/svg+xml',
+      references: [{ id: 'renamed-vector', sourcePath: structuralPath }],
+    }];
+    relinkArtifactDigests(missing.artifacts);
+    await expect(createMigrationBundle(missing)).resolves.toBeDefined();
+  });
+
+  it('rejects unsafe renamed SVG documents instead of admitting them as source text', async () => {
+    for (const [name, source] of [
+      ['script', '<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>'],
+      ['external', '<svg xmlns="http://www.w3.org/2000/svg"><use href="https://example.test/x.svg#x"/></svg>'],
+      ['doctype', '<!DOCTYPE svg><svg xmlns="http://www.w3.org/2000/svg"><path d="M0 0"/></svg>'],
+      ['entity', '<!DOCTYPE svg [<!ENTITY x "unsafe">]><svg xmlns="http://www.w3.org/2000/svg"><title>&x;</title></svg>'],
+      ['comment', '<!-- synthetic --><svg xmlns="http://www.w3.org/2000/svg"><path d="M0 0"/></svg>'],
+      ['many-comments', `${'<!-- synthetic -->'.repeat(65)}<svg xmlns="http://www.w3.org/2000/svg"><path d="M0 0"/></svg>`],
+      ['processing-instruction', '<?xml-stylesheet href="x.css"?><svg xmlns="http://www.w3.org/2000/svg"><path d="M0 0"/></svg>'],
+    ] as const) {
+      const bytes = encoder.encode(source);
+      const path = `public/renamed-${name}.txt`;
+      const candidate = [...baseCandidate, { path, bytes, executable: false }];
+      await expect(
+        createMigrationBundle(input({ candidate, artifacts: artifacts(candidate).compiled })),
+      ).rejects.toThrow(/^bundle_contract_invalid$/u);
+    }
+  });
+
+  it('does not confuse embedded SVG source or ordinary XML/HTML documents with SVG assets', async () => {
+    const candidate = [
+      ...baseCandidate,
+      {
+        path: 'components/icon.tsx',
+        bytes: encoder.encode("export const icon = '<svg viewBox=\\\"0 0 1 1\\\"></svg>';\n"),
+        executable: false,
+      },
+      {
+        path: 'config/feed.xml',
+        bytes: encoder.encode('<?xml version="1.0"?><configuration><item/></configuration>'),
+        executable: false,
+      },
+      {
+        path: 'public/page.html',
+        bytes: encoder.encode('<!doctype html><html><body><svg></svg></body></html>'),
+        executable: false,
+      },
+    ];
+    await expect(
+      createMigrationBundle(input({ candidate, artifacts: artifacts(candidate).compiled })),
+    ).resolves.toBeDefined();
+  });
+
+  it('rejects a PDF signature after a BOM/whitespace prefix end to end', async () => {
+    const bytes = new Uint8Array([
+      0xef, 0xbb, 0xbf, 0x20, 0x0a, 0x25, 0x50, 0x44, 0x46, 0x2d, 0x31, 0x2e, 0x37,
+    ]);
+    const candidate = [...baseCandidate, {
+      path: 'public/renamed-document.txt',
+      bytes,
+      executable: false,
+    }];
+    await expect(
+      createMigrationBundle(input({ candidate, artifacts: artifacts(candidate).compiled })),
+    ).rejects.toThrow(/^bundle_entry_forbidden$/u);
+  });
+
   it('rejects editorial blobs that fail the exact Task 4 image-byte inspection', async () => {
     const malformedWoff = Buffer.alloc(68);
     malformedWoff.write('wOFF', 0, 'ascii');

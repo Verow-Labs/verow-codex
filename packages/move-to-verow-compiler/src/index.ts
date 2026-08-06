@@ -94,6 +94,7 @@ export {
   type ThirdPartyBoundary,
 } from './content-extractor.js';
 export {
+  hasMigrationSvgDocumentStart,
   inspectMigrationAssetBytes,
   inventoryMigrationAssets,
   type AssetDigest,

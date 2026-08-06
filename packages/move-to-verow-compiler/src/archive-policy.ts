@@ -81,6 +81,53 @@ const FORBIDDEN_NAMES = new Set([
   'id_rsa',
   'token.json',
 ]);
+const STANDARD_CREDENTIAL_PATHS = [
+  '.azure/accesstokens.json',
+  '.cargo/credentials.toml',
+  '.config/gcloud/credentials.db',
+  '.config/gh/hosts.yml',
+  '.docker/config.json',
+  '.kube/config',
+  'composer/auth.json',
+] as const;
+const CREDENTIAL_DATA_EXTENSIONS = new Set([
+  '',
+  'db',
+  'env',
+  'ini',
+  'json',
+  'toml',
+  'txt',
+  'yaml',
+  'yml',
+]);
+const CREDENTIAL_SINGLETON_TOKENS = new Set([
+  'auth',
+  'credential',
+  'credentials',
+  'secret',
+  'secrets',
+  'token',
+]);
+const CREDENTIAL_ANYWHERE_TOKENS = new Set([
+  'credential',
+  'credentials',
+  'secret',
+  'secrets',
+  'token',
+]);
+const CREDENTIAL_TOKEN_PAIRS = new Set([
+  'access:key',
+  'access:token',
+  'access:tokens',
+  'api:key',
+  'client:secret',
+  'private:key',
+  'refresh:token',
+  'refresh:tokens',
+  'service:account',
+]);
+const PDF_PREFIX_WHITESPACE = new Set([0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x20]);
 interface BlockedFormat {
   extensions: readonly string[];
   signatures: readonly { offset: number; bytes: readonly number[] }[];
@@ -214,21 +261,55 @@ function extension(path: string): string {
   return dot < 0 ? '' : name.slice(dot).toLowerCase();
 }
 
+function hasPathSuffix(path: string, suffix: string): boolean {
+  return path === suffix || path.endsWith(`/${suffix}`);
+}
+
+function credentialBasenameTokens(name: string): { extension: string; tokens: string[] } {
+  const dot = name.lastIndexOf('.');
+  const extension = dot > 0 ? name.slice(dot + 1).toLowerCase() : '';
+  const stem = dot > 0 ? name.slice(0, dot) : name;
+  const canonical = stem
+    .replace(/([a-z0-9])([A-Z])/gu, '$1 $2')
+    .replace(/([A-Z]+)([A-Z][a-z])/gu, '$1 $2')
+    .normalize('NFKC')
+    .toLowerCase();
+  return {
+    extension,
+    tokens: canonical.split(/[._\-\s]+/u).filter(Boolean),
+  };
+}
+
+function hasCredentialBasename(name: string): boolean {
+  const { extension, tokens } = credentialBasenameTokens(name);
+  if (!CREDENTIAL_DATA_EXTENSIONS.has(extension) || tokens.length === 0) return false;
+  if (tokens.length === 1 && CREDENTIAL_SINGLETON_TOKENS.has(tokens[0] as string)) {
+    return true;
+  }
+  if (tokens.some((token) => CREDENTIAL_ANYWHERE_TOKENS.has(token))) {
+    return true;
+  }
+  for (let index = 0; index + 1 < tokens.length; index += 1) {
+    const pair = `${tokens[index]}:${tokens[index + 1]}`;
+    if (CREDENTIAL_TOKEN_PAIRS.has(pair)) return true;
+  }
+  return false;
+}
+
 function forbiddenName(path: string): boolean {
   const segments = path.split('/');
   const lower = segments.map((segment) => segment.toLowerCase());
+  const lowerPath = lower.join('/');
+  const rawName = segments.at(-1) ?? '';
   const name = lower.at(-1) ?? '';
   if (lower.some((segment) => FORBIDDEN_SEGMENTS.has(segment))) return true;
-  if (lower.length >= 2 && lower.at(-2) === '.docker' && name === 'config.json') return true;
+  if (STANDARD_CREDENTIAL_PATHS.some((suffix) => hasPathSuffix(lowerPath, suffix))) return true;
   if (FORBIDDEN_NAMES.has(name)) return true;
   if (name === '.env' || name.startsWith('.env.') || name === '.dev.vars' || name.startsWith('.dev.vars.')) return true;
   if (name.endsWith('.pem') || name.endsWith('.key') || name.endsWith('.p12') || name.endsWith('.pfx')) return true;
   if (name.endsWith('.tfstate') || name.endsWith('.tfstate.backup')) return true;
   if (/^(?:task-|compiler-).*(?:receipt|report).*\.json$/u.test(name)) return true;
-  if (/^secrets?(?:\.(?:ini|json|toml|txt|ya?ml))?$/u.test(name)) return true;
-  if (/^(?:access|api|auth|client|private|refresh)[._-](?:credentials?|key|secret|token)(?:[._-][a-z0-9-]+)*(?:\.(?:ini|json|toml|txt|ya?ml))?$/u.test(name)) return true;
-  if (/^service[._-]account(?:[._-](?:credentials?|key|secret|token))?(?:[._-][a-z0-9-]+)*(?:\.(?:ini|json|toml|txt|ya?ml))?$/u.test(name)) return true;
-  if (/^[a-z0-9][a-z0-9-]*(?:[._-][a-z0-9][a-z0-9-]*){0,2}[._-](?:credentials?|secret|token|service[._-]account)(?:\.(?:ini|json|toml|txt|ya?ml))?$/u.test(name)) return true;
+  if (hasCredentialBasename(rawName)) return true;
   return BLOCKED_FORMATS.some(({ extensions }) => extensions.some((suffix) => name.endsWith(suffix))) ||
     UNSAFE_BINARY_PATTERN.test(name);
 }
@@ -289,6 +370,23 @@ function hasUnsafeBinaryMagic(bytes: Uint8Array): boolean {
     ) {
       return true;
     }
+  }
+  let pdfOffset = 0;
+  if (bytes.byteLength >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
+    pdfOffset = 3;
+  }
+  const pdfPrefixLimit = Math.min(bytes.byteLength, pdfOffset + 256);
+  while (
+    pdfOffset < pdfPrefixLimit &&
+    PDF_PREFIX_WHITESPACE.has(bytes[pdfOffset] as number)
+  ) {
+    pdfOffset += 1;
+  }
+  if (
+    pdfOffset + 5 <= bytes.byteLength &&
+    [0x25, 0x50, 0x44, 0x46, 0x2d].every((byte, index) => bytes[pdfOffset + index] === byte)
+  ) {
+    return true;
   }
   return bytes.byteLength >= 2 && bytes[0] === 0x4d && bytes[1] === 0x5a;
 }

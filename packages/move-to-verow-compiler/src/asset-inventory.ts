@@ -389,9 +389,81 @@ function validCaptureReceiptLinkage(receipt: CaptureReceiptV1, bytes: Uint8Array
   return receipt.byteCount === bytes.byteLength && receipt.byteLimit >= bytes.byteLength && receipt.digest === digest && receipt.sniffedMime === mime;
 }
 
-function looksLikeSvg(bytes: Uint8Array): boolean {
-  const prefix = new TextDecoder('utf-8', { fatal: false }).decode(bytes.subarray(0, Math.min(bytes.byteLength, 256))).trimStart();
-  return prefix.startsWith('<svg') || prefix.startsWith('<?xml');
+const SVG_DOCUMENT_PREFIX_BYTES = 65_536;
+
+function skipAsciiWhitespace(source: string, start: number): number {
+  let cursor = start;
+  while (cursor < source.length && /[\t\n\v\f\r ]/u.test(source[cursor] as string)) cursor += 1;
+  return cursor;
+}
+
+function markupDeclarationEnd(source: string, start: number): number | null {
+  let quote: '"' | "'" | null = null;
+  let subsetDepth = 0;
+  for (let cursor = start; cursor < source.length; cursor += 1) {
+    const character = source[cursor];
+    if (quote !== null) {
+      if (character === quote) quote = null;
+      continue;
+    }
+    if (character === '"' || character === "'") {
+      quote = character;
+    } else if (character === '[') {
+      subsetDepth += 1;
+    } else if (character === ']' && subsetDepth > 0) {
+      subsetDepth -= 1;
+    } else if (character === '>' && subsetDepth === 0) {
+      return cursor + 1;
+    }
+  }
+  return null;
+}
+
+export function hasMigrationSvgDocumentStart(bytes: Uint8Array): boolean {
+  if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0) return false;
+  const truncated = bytes.byteLength > SVG_DOCUMENT_PREFIX_BYTES;
+  const source = new TextDecoder('utf-8', { fatal: false }).decode(
+    bytes.subarray(0, Math.min(bytes.byteLength, SVG_DOCUMENT_PREFIX_BYTES)),
+  );
+  let cursor = source.startsWith('\uFEFF') ? 1 : 0;
+  while (cursor <= source.length) {
+    cursor = skipAsciiWhitespace(source, cursor);
+    if (cursor === source.length) return truncated;
+    if (source.startsWith('<!--', cursor)) {
+      const end = source.indexOf('-->', cursor + 4);
+      if (end < 0) return truncated;
+      cursor = end + 3;
+      continue;
+    }
+    if (source.startsWith('<?', cursor)) {
+      const end = source.indexOf('?>', cursor + 2);
+      if (end < 0) return truncated;
+      cursor = end + 2;
+      continue;
+    }
+    if (source.slice(cursor, cursor + 9).toLowerCase() === '<!doctype') {
+      const nameStart = skipAsciiWhitespace(source, cursor + 9);
+      const name = /^[A-Za-z_:][\w:.-]*/u.exec(source.slice(nameStart))?.[0]?.toLowerCase();
+      if (name === 'svg') return true;
+      const end = markupDeclarationEnd(source, nameStart);
+      if (end === null) return truncated;
+      cursor = end;
+      continue;
+    }
+    const root = /^<svg(?=[\t\n\f\r />:]|$)/iu.exec(source.slice(cursor));
+    return root !== null;
+  }
+  return truncated;
+}
+
+function stripSvgXmlDeclaration(source: string): string | null {
+  let cursor = source.startsWith('\uFEFF') ? 1 : 0;
+  cursor = skipAsciiWhitespace(source, cursor);
+  if (!source.startsWith('<?xml', cursor)) return source.slice(cursor);
+  const declaration = /^<\?xml\s+[^<>&?]*\?>/iu.exec(source.slice(cursor));
+  if (declaration === null) return null;
+  const rootStart = skipAsciiWhitespace(source, cursor + declaration[0].length);
+  return source.slice(rootStart);
 }
 
 interface SvgElementFrame { id?: string; tag: string }
@@ -404,6 +476,9 @@ function validateSafeSvg(bytes: Uint8Array, limits: AssetInventoryLimits): boole
   } catch {
     return false;
   }
+  const declarationFreeSource = stripSvgXmlDeclaration(source);
+  if (declarationFreeSource === null) return false;
+  source = declarationFreeSource;
   if (hasControlCharacters(source) || /<!DOCTYPE|<!ENTITY|<!\[CDATA|<!--|<\?(?!xml\s)|&/iu.test(source)) return false;
   if (/<\s*(?:script|foreignObject|style|animate|animateMotion|animateTransform|set|filter|fe\w+|image|audio|video|iframe|object|embed|link|meta)\b/iu.test(source)) return false;
   if (/\son[a-z][\w:-]*\s*=|\sstyle\s*=|@import|url\s*\(/iu.test(source)) return false;
@@ -690,7 +765,7 @@ function inspectFontBytes(bytes: Uint8Array, limits: AssetInventoryLimits): { mi
 }
 
 async function inspectImage(bytes: Uint8Array, limits: AssetInventoryLimits): Promise<Omit<InventoriedAsset, 'digest' | 'bytes' | 'bytesValue' | 'references'> | null> {
-  const svg = looksLikeSvg(bytes);
+  const svg = hasMigrationSvgDocumentStart(bytes);
   if (svg ? !validateSafeSvg(bytes, limits) : !validRasterContainer(bytes)) return null;
   try {
     const metadata: Metadata = await sharp(bytes, { animated: true, failOn: 'error', limitInputPixels: limits.maxPixels, sequentialRead: true }).metadata();

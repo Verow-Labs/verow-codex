@@ -87,6 +87,21 @@ describe('migration archive admission policy', () => {
     'config/stripe-secret',
     'config/aws_credentials',
     'config/google-service-account',
+    '.kube/config',
+    '.config/gh/hosts.yml',
+    '.config/gcloud/credentials.db',
+    '.azure/accessTokens.json',
+    '.cargo/credentials.toml',
+    'composer/auth.json',
+    'config/credentials.toml',
+    'config/token.yaml',
+    'config/secret.env',
+    'config/auth.json',
+    'config/openai-api-key',
+    'config/openaiApiKey.json',
+    'config/sendgrid_api_key.txt',
+    'config/aws-access-key-id',
+    'config/awsAccessKeyId.json',
     'fixture.zst',
     'bundle.tar.zst',
     'bundle.tar.zstd',
@@ -106,8 +121,12 @@ describe('migration archive admission policy', () => {
         entry('people/secretary.ts'),
         entry('styles/keyframes.css'),
         entry('lib/api-client.ts'),
+        entry('lib/authentication.ts'),
+        entry('lib/auth-provider.ts'),
         entry('config/site.json'),
         entry('config/theme.yaml'),
+        entry('config/auth-provider.json'),
+        entry('config/design-tokens.json'),
         entry('docker/config.example.json'),
       ]),
     ).not.toThrow();
@@ -199,6 +218,28 @@ describe('migration archive admission policy', () => {
       new TextEncoder().encode('%PDE-1.7 synthetic text'),
     ]) {
       expect(() => assertArchiveEntries([entry('format-neighbor.txt', { bytes: content })])).not.toThrow();
+    }
+  });
+
+  it('rejects PDF magic after only a bounded BOM and ASCII-whitespace prefix', () => {
+    for (const content of [
+      new TextEncoder().encode('\n  %PDF-1.7 synthetic'),
+      new Uint8Array([0xef, 0xbb, 0xbf, 0x09, 0x0d, 0x0a, 0x25, 0x50, 0x44, 0x46, 0x2d, 0x31]),
+      new Uint8Array([0x0b, 0x25, 0x50, 0x44, 0x46, 0x2d, 0x31]),
+    ]) {
+      expect(() => assertArchiveEntries([entry('prefixed-document.txt', { bytes: content })])).toThrow(
+        /^bundle_entry_forbidden$/u,
+      );
+    }
+  });
+
+  it('does not scan arbitrary source text for PDF-like substrings', () => {
+    for (const content of [
+      new TextEncoder().encode('%PDE-1.7 synthetic'),
+      new TextEncoder().encode("export const signature = '%PDF-1.7';\n"),
+      new TextEncoder().encode('not-a-document\n%PDF-1.7'),
+    ]) {
+      expect(() => assertArchiveEntries([entry('pdf-control.ts', { bytes: content })])).not.toThrow();
     }
   });
 

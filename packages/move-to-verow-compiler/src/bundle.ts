@@ -20,7 +20,7 @@ import {
   validateBundleDescriptor,
   validatePayloadIndex,
 } from './bundle-contract.js';
-import { inspectMigrationAssetBytes } from './asset-inventory.js';
+import { hasMigrationSvgDocumentStart, inspectMigrationAssetBytes } from './asset-inventory.js';
 import { normalizeSemanticSegment } from './content-key.js';
 import { digestFileInventory, type InventoriedFile } from './inventory.js';
 import {
@@ -1303,6 +1303,13 @@ async function assertArtifactContracts(
   }
   for (const entry of candidate) {
     if (structuralMimeByPath.has(entry.path)) continue;
+    if (hasMigrationSvgDocumentStart(entry.bytes)) {
+      const inspected = await inspectMigrationAssetBytes(entry.bytes);
+      if (inspected === null || inspected.mime !== 'image/svg+xml') {
+        fail('bundle_contract_invalid');
+      }
+      fail('bundle_contract_invalid');
+    }
     if (entry.path.toLowerCase().endsWith('.svg')) {
       fail('bundle_contract_invalid');
     }
