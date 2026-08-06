@@ -52,6 +52,7 @@ const FORBIDDEN_SEGMENTS = new Set([
   '.parcel-cache',
   '.pnpm-store',
   '.sanity',
+  '.ssh',
   '.superpowers',
   '.turbo',
   '.vercel',
@@ -66,6 +67,7 @@ const FORBIDDEN_SEGMENTS = new Set([
 const FORBIDDEN_NAMES = new Set([
   '.bash_history',
   '.ds_store',
+  '.git-credentials',
   '.netrc',
   '.npmrc',
   '.pypirc',
@@ -74,10 +76,57 @@ const FORBIDDEN_NAMES = new Set([
   'credentials',
   'credentials.json',
   'id_ed25519',
+  'id_ecdsa',
+  'id_dsa',
   'id_rsa',
   'token.json',
 ]);
-const NESTED_ARCHIVE_PATTERN = /(?:\.7z|\.bz2|\.gz|\.jar|\.rar|\.tar|\.tar\.(?:bz2|gz|xz)|\.tgz|\.war|\.xz|\.zip)$/iu;
+interface BlockedFormat {
+  extensions: readonly string[];
+  signatures: readonly { offset: number; bytes: readonly number[] }[];
+}
+
+// Finite formats that are never admitted as candidate source, by either name or bytes.
+const BLOCKED_FORMATS: readonly BlockedFormat[] = [
+  { extensions: ['.zip', '.jar', '.war'], signatures: [
+    { offset: 0, bytes: [0x50, 0x4b, 0x03, 0x04] },
+    { offset: 0, bytes: [0x50, 0x4b, 0x05, 0x06] },
+    { offset: 0, bytes: [0x50, 0x4b, 0x07, 0x08] },
+  ] },
+  { extensions: ['.gz', '.tgz', '.tar.gz'], signatures: [{ offset: 0, bytes: [0x1f, 0x8b] }] },
+  { extensions: ['.7z'], signatures: [{ offset: 0, bytes: [0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c] }] },
+  { extensions: ['.rar'], signatures: [
+    { offset: 0, bytes: [0x52, 0x61, 0x72, 0x21, 0x1a, 0x07, 0x00] },
+    { offset: 0, bytes: [0x52, 0x61, 0x72, 0x21, 0x1a, 0x07, 0x01, 0x00] },
+  ] },
+  { extensions: ['.bz2', '.tar.bz2'], signatures: [{ offset: 0, bytes: [0x42, 0x5a, 0x68] }] },
+  { extensions: ['.xz', '.tar.xz'], signatures: [{ offset: 0, bytes: [0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00] }] },
+  { extensions: ['.tar'], signatures: [{ offset: 257, bytes: [0x75, 0x73, 0x74, 0x61, 0x72] }] },
+  { extensions: ['.zst', '.zstd', '.tar.zst', '.tar.zstd'], signatures: [
+    { offset: 0, bytes: [0x28, 0xb5, 0x2f, 0xfd] },
+    ...Array.from({ length: 16 }, (_, index) => ({
+      offset: 0,
+      bytes: [0x50 + index, 0x2a, 0x4d, 0x18],
+    })),
+  ] },
+  { extensions: ['.lz4', '.tar.lz4'], signatures: [
+    { offset: 0, bytes: [0x04, 0x22, 0x4d, 0x18] },
+    { offset: 0, bytes: [0x02, 0x21, 0x4c, 0x18] },
+  ] },
+  { extensions: ['.cab'], signatures: [{ offset: 0, bytes: [0x4d, 0x53, 0x43, 0x46] }] },
+  { extensions: ['.a', '.ar'], signatures: [
+    { offset: 0, bytes: [0x21, 0x3c, 0x61, 0x72, 0x63, 0x68, 0x3e, 0x0a] },
+    { offset: 0, bytes: [0x21, 0x3c, 0x74, 0x68, 0x69, 0x6e, 0x3e, 0x0a] },
+  ] },
+  { extensions: ['.cpio'], signatures: [
+    { offset: 0, bytes: [0x30, 0x37, 0x30, 0x37, 0x30, 0x31] },
+    { offset: 0, bytes: [0x30, 0x37, 0x30, 0x37, 0x30, 0x32] },
+    { offset: 0, bytes: [0x30, 0x37, 0x30, 0x37, 0x30, 0x37] },
+    { offset: 0, bytes: [0x71, 0xc7] },
+    { offset: 0, bytes: [0xc7, 0x71] },
+  ] },
+  { extensions: ['.pdf'], signatures: [{ offset: 0, bytes: [0x25, 0x50, 0x44, 0x46, 0x2d] }] },
+];
 const UNSAFE_BINARY_PATTERN = /(?:\.bin|\.class|\.com|\.dll|\.dylib|\.exe|\.msi|\.node|\.so|\.wasm)$/iu;
 const EXECUTABLE_EXTENSIONS = new Set(['.cjs', '.js', '.mjs', '.sh', '.ts']);
 
@@ -170,15 +219,18 @@ function forbiddenName(path: string): boolean {
   const lower = segments.map((segment) => segment.toLowerCase());
   const name = lower.at(-1) ?? '';
   if (lower.some((segment) => FORBIDDEN_SEGMENTS.has(segment))) return true;
+  if (lower.length >= 2 && lower.at(-2) === '.docker' && name === 'config.json') return true;
   if (FORBIDDEN_NAMES.has(name)) return true;
   if (name === '.env' || name.startsWith('.env.') || name === '.dev.vars' || name.startsWith('.dev.vars.')) return true;
   if (name.endsWith('.pem') || name.endsWith('.key') || name.endsWith('.p12') || name.endsWith('.pfx')) return true;
   if (name.endsWith('.tfstate') || name.endsWith('.tfstate.backup')) return true;
   if (/^(?:task-|compiler-).*(?:receipt|report).*\.json$/u.test(name)) return true;
-  if (/^secrets?\.(?:ini|json|toml|txt|ya?ml)$/u.test(name)) return true;
-  if (/^(?:access|api|auth|client|refresh)[._-](?:credentials?|key|secret|token)(?:[._-][a-z0-9-]+)*\.(?:ini|json|toml|txt|ya?ml)$/u.test(name)) return true;
-  if (/^service[._-]account(?:[._-](?:credentials?|key|secret|token))?(?:[._-][a-z0-9-]+)*\.(?:ini|json|toml|txt|ya?ml)$/u.test(name)) return true;
-  return NESTED_ARCHIVE_PATTERN.test(name) || UNSAFE_BINARY_PATTERN.test(name);
+  if (/^secrets?(?:\.(?:ini|json|toml|txt|ya?ml))?$/u.test(name)) return true;
+  if (/^(?:access|api|auth|client|private|refresh)[._-](?:credentials?|key|secret|token)(?:[._-][a-z0-9-]+)*(?:\.(?:ini|json|toml|txt|ya?ml))?$/u.test(name)) return true;
+  if (/^service[._-]account(?:[._-](?:credentials?|key|secret|token))?(?:[._-][a-z0-9-]+)*(?:\.(?:ini|json|toml|txt|ya?ml))?$/u.test(name)) return true;
+  if (/^[a-z0-9][a-z0-9-]*(?:[._-][a-z0-9][a-z0-9-]*){0,2}[._-](?:credentials?|secret|token|service[._-]account)(?:\.(?:ini|json|toml|txt|ya?ml))?$/u.test(name)) return true;
+  return BLOCKED_FORMATS.some(({ extensions }) => extensions.some((suffix) => name.endsWith(suffix))) ||
+    UNSAFE_BINARY_PATTERN.test(name);
 }
 
 export function assertSafeRelativePath(path: unknown, limits: ArchiveLimits): asserts path is string {
@@ -220,6 +272,12 @@ function assertExecutable(entry: BundleEntryInput): void {
 }
 
 function hasUnsafeBinaryMagic(bytes: Uint8Array): boolean {
+  if (BLOCKED_FORMATS.some(({ signatures }) => signatures.some((signature) =>
+    signature.offset + signature.bytes.length <= bytes.byteLength &&
+    signature.bytes.every((byte, index) => bytes[signature.offset + index] === byte),
+  ))) {
+    return true;
+  }
   if (bytes.byteLength >= 4) {
     const signature = [bytes[0], bytes[1], bytes[2], bytes[3]];
     if (
@@ -231,27 +289,6 @@ function hasUnsafeBinaryMagic(bytes: Uint8Array): boolean {
     ) {
       return true;
     }
-  }
-  if (bytes.byteLength >= 6) {
-    const prefix = Buffer.from(bytes.subarray(0, 6)).toString('hex');
-    if (
-      prefix.startsWith('504b0304') ||
-      prefix.startsWith('504b0506') ||
-      prefix.startsWith('504b0708') ||
-      prefix.startsWith('1f8b') ||
-      prefix === '377abcaf271c' ||
-      prefix.startsWith('526172211a07') ||
-      prefix.startsWith('425a68') ||
-      prefix === 'fd377a585a00'
-    ) {
-      return true;
-    }
-  }
-  if (
-    bytes.byteLength >= 262 &&
-    Buffer.from(bytes.subarray(257, 262)).toString('ascii') === 'ustar'
-  ) {
-    return true;
   }
   return bytes.byteLength >= 2 && bytes[0] === 0x4d && bytes[1] === 0x5a;
 }

@@ -20,6 +20,8 @@ import {
   validateBundleDescriptor,
   validatePayloadIndex,
 } from './bundle-contract.js';
+import { inspectMigrationAssetBytes } from './asset-inventory.js';
+import { normalizeSemanticSegment } from './content-key.js';
 import { digestFileInventory, type InventoriedFile } from './inventory.js';
 import {
   canonicalPublicHttpsUrl as canonicalTask4PublicHttpsUrl,
@@ -591,10 +593,12 @@ function assertArtifactSemantics(input: CompiledMigrationArtifacts): void {
     fail('bundle_contract_invalid');
   }
 
+  const fixtureValues = new Map<string, string>();
   for (const value of contentFixture.values) {
     if (!validArtifactIdentity({ key: value.key, locale: value.locale, variant: value.variant }) || typeof value.value !== 'string') {
       fail('bundle_contract_invalid');
     }
+    fixtureValues.set(identityKey(value), value.value);
   }
   for (const asset of contentFixture.editorialAssets) {
     if (!validDigest(asset.digest) || !validArtifactIdentity(asset.target)) fail('bundle_contract_invalid');
@@ -714,6 +718,84 @@ function assertArtifactSemantics(input: CompiledMigrationArtifacts): void {
       pair.variant !== target.variant ||
       (target.imagePair.role === 'image' && (target.valueType !== 'image' || pair.valueType !== 'string')) ||
       (target.imagePair.role === 'alt' && (target.valueType !== 'string' || pair.valueType !== 'image'))
+    ) {
+      fail('bundle_contract_invalid');
+    }
+  }
+  for (const target of privateManifest.targets) {
+    if (target.valueType !== 'image') continue;
+    const suffix = target.key.endsWith('.src')
+      ? '.src'
+      : target.key.endsWith('.image')
+        ? '.image'
+        : null;
+    const altKey = suffix === null ? null : `${target.key.slice(0, -suffix.length)}.alt`;
+    if (
+      altKey !== null &&
+      targetIdentities.has(identityKey({ key: altKey, locale: target.locale, variant: target.variant })) &&
+      target.imagePair === null
+    ) {
+      fail('bundle_contract_invalid');
+    }
+  }
+
+  const claimedCollectionItems = new Set<string>();
+  for (const root of privateManifest.targets) {
+    if (root.valueType !== 'collection') continue;
+    const collection = root.collection;
+    if (collection === null) fail('bundle_contract_invalid');
+    let stableIds: unknown;
+    try {
+      stableIds = JSON.parse(fixtureValues.get(identityKey(root)) ?? '');
+    } catch {
+      fail('bundle_contract_invalid');
+    }
+    if (
+      !isPlainArray<string>(stableIds, 1_000) ||
+      stableIds.length < collection.minimumItems ||
+      stableIds.length > collection.maximumItems ||
+      stableIds.some((stableId) => !safeString(stableId, 200)) ||
+      new Set(stableIds).size !== stableIds.length ||
+      stableIds.some((stableId, index) => index > 0 && compareUtf8(stableIds[index - 1] as string, stableId) >= 0) ||
+      collection.requiredItemIds.some((required) => !stableIds.includes(required))
+    ) {
+      fail('bundle_contract_invalid');
+    }
+    const normalizedIds = new Set<string>();
+    try {
+      for (const stableId of stableIds) {
+        const normalized = normalizeSemanticSegment(stableId);
+        if (normalizedIds.has(normalized)) fail('bundle_contract_invalid');
+        normalizedIds.add(normalized);
+      }
+    } catch {
+      fail('bundle_contract_invalid');
+    }
+    const prefix = `${root.key}.items.`;
+    const found = new Set<string>();
+    for (const target of privateManifest.targets) {
+      if (
+        target.locale !== root.locale ||
+        target.variant !== root.variant ||
+        !target.key.startsWith(prefix)
+      ) {
+        continue;
+      }
+      const remainder = target.key.slice(prefix.length);
+      const itemId = remainder.split('.')[0] ?? '';
+      if (!normalizedIds.has(itemId) || remainder === itemId) fail('bundle_contract_invalid');
+      found.add(itemId);
+      claimedCollectionItems.add(identityKey(target));
+    }
+    if ([...normalizedIds].some((stableId) => !found.has(stableId))) {
+      fail('bundle_contract_invalid');
+    }
+  }
+  for (const target of privateManifest.targets) {
+    if (
+      target.valueType !== 'collection' &&
+      target.key.includes('.items.') &&
+      !claimedCollectionItems.has(identityKey(target))
     ) {
       fail('bundle_contract_invalid');
     }
@@ -838,10 +920,9 @@ function normalizeArtifacts(input: CompiledMigrationArtifacts): CompiledMigratio
     if (length === null) fail('bundle_input_invalid');
     if (length > 2_000) fail('bundle_limit_exceeded');
   }
-  assertArtifactNestedShapes(input);
-  assertArtifactSemantics(input);
-
   const copy = canonicalCopy(input);
+  assertArtifactNestedShapes(copy);
+  assertArtifactSemantics(copy);
   sortIdentities(copy.contentFixture.values);
   copy.contentFixture.editorialAssets.sort((left, right) =>
     compareUtf8(identityKey(left.target), identityKey(right.target)),
@@ -1042,50 +1123,6 @@ function normalizedEditorialAssets(
   return assets;
 }
 
-function startsWithBytes(bytes: Uint8Array, prefix: readonly number[]): boolean {
-  return prefix.length <= bytes.byteLength && prefix.every((value, index) => bytes[index] === value);
-}
-
-function inspectedAssetMime(path: string, bytes: Uint8Array): string | null {
-  if (startsWithBytes(bytes, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) return 'image/png';
-  if (startsWithBytes(bytes, [0xff, 0xd8, 0xff])) return 'image/jpeg';
-  if (
-    startsWithBytes(bytes, [0x47, 0x49, 0x46, 0x38, 0x37, 0x61]) ||
-    startsWithBytes(bytes, [0x47, 0x49, 0x46, 0x38, 0x39, 0x61])
-  ) {
-    return 'image/gif';
-  }
-  if (
-    bytes.byteLength >= 12 &&
-    Buffer.from(bytes.subarray(0, 4)).toString('ascii') === 'RIFF' &&
-    Buffer.from(bytes.subarray(8, 12)).toString('ascii') === 'WEBP'
-  ) {
-    return 'image/webp';
-  }
-  if (
-    bytes.byteLength >= 12 &&
-    Buffer.from(bytes.subarray(4, 8)).toString('ascii') === 'ftyp' &&
-    ['avif', 'avis'].includes(Buffer.from(bytes.subarray(8, 12)).toString('ascii'))
-  ) {
-    return 'image/avif';
-  }
-  if (startsWithBytes(bytes, [0x77, 0x4f, 0x46, 0x46])) return 'font/woff';
-  if (startsWithBytes(bytes, [0x77, 0x4f, 0x46, 0x32])) return 'font/woff2';
-  let text: string;
-  try {
-    text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
-  } catch {
-    return null;
-  }
-  if (
-    (path.toLowerCase().endsWith('.svg') || /<svg(?:\s|>)/u.test(text)) &&
-    /^\s*(?:<\?xml[^>]*>\s*)?(?:<!--[\s\S]*?-->\s*)*<svg(?:\s|>)/u.test(text)
-  ) {
-    return 'image/svg+xml';
-  }
-  return null;
-}
-
 function isAdmittedSourceText(bytes: Uint8Array): boolean {
   let text: string;
   try {
@@ -1102,7 +1139,7 @@ function isAdmittedSourceText(bytes: Uint8Array): boolean {
   return true;
 }
 
-function assertArtifactContracts(
+async function assertArtifactContracts(
   artifacts: CompiledMigrationArtifacts,
   input: Pick<CreateMigrationBundleInput, 'migrationId' | 'sourceDigest' | 'websiteId'>,
   candidateDigest: Digest,
@@ -1110,7 +1147,7 @@ function assertArtifactContracts(
   candidateDigests: ReadonlyMap<string, Digest>,
   candidate: readonly BundleEntryInput[],
   editorialAssets: readonly EditorialAssetBlobInput[],
-): void {
+): Promise<void> {
   const { contentFixture, privateManifest, repositoryBinding, runtimeExpectation, digests } = artifacts;
   if (
     contentFixture.format !== CONTENT_FIXTURE_FORMAT ||
@@ -1230,10 +1267,19 @@ function assertArtifactContracts(
     fail('bundle_contract_invalid');
   }
   for (const asset of editorialAssets) {
-    if (sha256(asset.bytes) !== asset.digest) fail('bundle_contract_invalid');
+    const inspected = await inspectMigrationAssetBytes(asset.bytes);
+    if (
+      sha256(asset.bytes) !== asset.digest ||
+      inspected === null ||
+      !inspected.mime.startsWith('image/')
+    ) {
+      fail('bundle_contract_invalid');
+    }
   }
   const structuralDigests = new Set<string>();
   const structuralMimeByPath = new Map<string, string>();
+  const candidateByPath = new Map(candidate.map((entry) => [entry.path, entry.bytes]));
+  const inspectedStructural = new Map<string, Awaited<ReturnType<typeof inspectMigrationAssetBytes>>>();
   for (const asset of privateManifest.structuralAssets) {
     if (asset.references.length === 0 || structuralDigests.has(asset.digest)) {
       fail('bundle_contract_invalid');
@@ -1246,19 +1292,25 @@ function assertArtifactContracts(
       }
       structuralMimeByPath.set(reference.sourcePath, asset.mime);
     }
+    const structuralBytes = candidateByPath.get(asset.references[0]?.sourcePath ?? '');
+    if (structuralBytes === undefined) fail('bundle_contract_invalid');
+    let inspected = inspectedStructural.get(asset.digest);
+    if (inspected === undefined) {
+      inspected = await inspectMigrationAssetBytes(structuralBytes);
+      inspectedStructural.set(asset.digest, inspected);
+    }
+    if (inspected === null || inspected.mime !== asset.mime) fail('bundle_contract_invalid');
   }
   for (const entry of candidate) {
-    const mime = inspectedAssetMime(entry.path, entry.bytes);
-    const declaredMime = structuralMimeByPath.get(entry.path);
-    if (mime !== null) {
-      if (declaredMime !== mime) fail('bundle_contract_invalid');
-    } else if (entry.path.toLowerCase().endsWith('.svg')) {
+    if (structuralMimeByPath.has(entry.path)) continue;
+    if (entry.path.toLowerCase().endsWith('.svg')) {
       fail('bundle_contract_invalid');
-    } else if (!isAdmittedSourceText(entry.bytes)) {
-      fail('bundle_entry_forbidden');
     }
-    if (declaredMime !== undefined && mime !== declaredMime) {
-      fail('bundle_contract_invalid');
+    if (!isAdmittedSourceText(entry.bytes)) {
+      if (await inspectMigrationAssetBytes(entry.bytes) !== null) {
+        fail('bundle_contract_invalid');
+      }
+      fail('bundle_entry_forbidden');
     }
   }
 }
@@ -1583,7 +1635,7 @@ export async function createMigrationBundle(
   }
   const artifacts = normalizeArtifacts(rawInput.artifacts);
   const candidateIdentity = candidateInventory(candidate);
-  assertArtifactContracts(
+  await assertArtifactContracts(
     artifacts,
     reviewedIdentity,
     candidateIdentity.digest,

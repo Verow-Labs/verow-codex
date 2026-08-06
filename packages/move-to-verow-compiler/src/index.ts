@@ -94,6 +94,7 @@ export {
   type ThirdPartyBoundary,
 } from './content-extractor.js';
 export {
+  inspectMigrationAssetBytes,
   inventoryMigrationAssets,
   type AssetDigest,
   type AssetInput,
@@ -111,6 +112,7 @@ export {
   type HostedSourceCaptureAssetInput,
   type InventoriedAsset,
   type InventoriedAssetReference,
+  type InspectedMigrationAssetBytes,
   type SourceLocalAssetInput,
   type StructuralFontLicense,
 } from './asset-inventory.js';

@@ -3,7 +3,11 @@ import { brotliCompressSync } from 'node:zlib';
 
 import { describe, expect, it, vi } from 'vitest';
 
-import { inventoryMigrationAssets, type AssetInput } from './asset-inventory.js';
+import {
+  inspectMigrationAssetBytes,
+  inventoryMigrationAssets,
+  type AssetInput,
+} from './asset-inventory.js';
 
 const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScL7qQAAAABJRU5ErkJggg==', 'base64');
 const png2x2 = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAACXBIWXMAAAPoAAAD6AG1e1JrAAAAEUlEQVR4nGP4z8DwH4QZYAwAR8oH+WdZbrcAAAAASUVORK5CYII=', 'base64');
@@ -21,6 +25,20 @@ function syntheticWoff2(options: { count: number; directory: Uint8Array; decompr
   bytes.writeUInt32BE(body.byteLength, 20);
   Buffer.from(options.directory).copy(bytes, 48);
   body.copy(bytes, 48 + options.directory.byteLength);
+  return bytes;
+}
+
+function syntheticWoff(): Buffer {
+  const bytes = Buffer.alloc(68);
+  bytes.write('wOFF', 0, 'ascii');
+  bytes.writeUInt32BE(0x0001_0000, 4);
+  bytes.writeUInt32BE(bytes.byteLength, 8);
+  bytes.writeUInt16BE(1, 12);
+  bytes.writeUInt32BE(32, 16);
+  bytes.write('name', 44, 'ascii');
+  bytes.writeUInt32BE(64, 48);
+  bytes.writeUInt32BE(4, 52);
+  bytes.writeUInt32BE(4, 56);
   return bytes;
 }
 
@@ -51,6 +69,42 @@ function local(overrides: Partial<Extract<AssetInput, { authority: 'source_local
 }
 
 describe('migration asset inventory', () => {
+  it('exposes the exact Task 4 byte inspector without requiring forged license metadata', async () => {
+    const safeSvg = Buffer.from(
+      '<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"><rect width="1" height="1"/></svg>',
+    );
+    const woff = syntheticWoff();
+    const woff2 = syntheticWoff2({
+      count: 1,
+      directory: Buffer.from([5, 4]),
+      decompressed: Buffer.alloc(4),
+      totalSfntSize: 32,
+    });
+    await expect(inspectMigrationAssetBytes(png)).resolves.toMatchObject({ mime: 'image/png' });
+    await expect(inspectMigrationAssetBytes(safeSvg)).resolves.toMatchObject({ mime: 'image/svg+xml' });
+    await expect(inspectMigrationAssetBytes(woff)).resolves.toEqual({ mime: 'font/woff' });
+    await expect(inspectMigrationAssetBytes(woff2)).resolves.toEqual({ mime: 'font/woff2' });
+
+    const malformedWoff = Buffer.from(woff);
+    malformedWoff.writeUInt32BE(0, 16);
+    const decompressionBomb = syntheticWoff2({
+      count: 1,
+      directory: Buffer.from([5, 4]),
+      decompressed: Buffer.alloc(4),
+      totalSfntSize: 10_000_004,
+    });
+    for (const invalid of [
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>'),
+      Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"><use href="https://example.test/x.svg#x"/></svg>'),
+      malformedWoff,
+      decompressionBomb,
+      Buffer.alloc(20_000_001),
+    ]) {
+      await expect(inspectMigrationAssetBytes(invalid)).resolves.toBeNull();
+    }
+  });
+
   it('deduplicates identical editorial PNG bytes while retaining sorted references and inspected oriented metadata', async () => {
     const result = await inventoryMigrationAssets({
       assets: [
@@ -233,16 +287,7 @@ describe('migration asset inventory', () => {
   });
 
   it('accepts licensed structural WOFF evidence but blocks arbitrary structural binary and missing font licensing', async () => {
-    const woff = Buffer.alloc(68);
-    woff.write('wOFF', 0, 'ascii');
-    woff.writeUInt32BE(0x0001_0000, 4);
-    woff.writeUInt32BE(woff.byteLength, 8);
-    woff.writeUInt16BE(1, 12);
-    woff.writeUInt32BE(32, 16);
-    woff.write('name', 44, 'ascii');
-    woff.writeUInt32BE(64, 48);
-    woff.writeUInt32BE(4, 52);
-    woff.writeUInt32BE(4, 56);
+    const woff = syntheticWoff();
     const font = local({
       classification: 'structural_git', bytes: woff, digest: sha256(woff),
       reference: { id: 'brand-font', sourcePath: 'fonts/brand.woff' },
@@ -289,16 +334,7 @@ describe('migration asset inventory', () => {
     fakeWoff2.writeUInt32BE(fakeWoff2.byteLength, 8);
     fakeWoff2.writeUInt16BE(1, 12);
 
-    const validWoff = Buffer.alloc(68);
-    validWoff.write('wOFF', 0, 'ascii');
-    validWoff.writeUInt32BE(0x0001_0000, 4);
-    validWoff.writeUInt32BE(validWoff.byteLength, 8);
-    validWoff.writeUInt16BE(1, 12);
-    validWoff.writeUInt32BE(32, 16);
-    validWoff.write('name', 44, 'ascii');
-    validWoff.writeUInt32BE(64, 48);
-    validWoff.writeUInt32BE(4, 52);
-    validWoff.writeUInt32BE(4, 56);
+    const validWoff = syntheticWoff();
     const malformed = [
       fakeWoff2,
       (() => { const bytes = Buffer.from(validWoff); bytes.writeUInt32BE(0, 16); return bytes; })(),

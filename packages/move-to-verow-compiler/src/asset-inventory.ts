@@ -145,6 +145,19 @@ export interface AssetInventoryInput {
   limits?: Partial<AssetInventoryLimits>;
 }
 
+export type InspectedMigrationAssetBytes =
+  | { mime: 'font/woff' | 'font/woff2' }
+  | {
+      mime: string;
+      encodedWidth: number;
+      encodedHeight: number;
+      renderedWidth: number;
+      renderedHeight: number;
+      pageCount: number;
+      animated: boolean;
+      sanitizerPolicy?: { version: 'move-to-verow.svg-safety.v1'; digest: AssetDigest };
+    };
+
 const DEFAULT_LIMITS: Readonly<AssetInventoryLimits> = {
   maxAssets: 500,
   maxSingleBytes: 20_000_000,
@@ -663,8 +676,7 @@ function inspectWoff2(buffer: Buffer, limits: AssetInventoryLimits): boolean {
   return cursor === buffer.length;
 }
 
-function inspectFont(bytes: Uint8Array, license: StructuralFontLicense | undefined, limits: AssetInventoryLimits): { mime: string } | null {
-  if (license === undefined || !['OFL-1.1', 'Apache-2.0', 'MIT', 'BSD-3-Clause'].includes(license.spdxId) || !safeToken(license.notice)) return null;
+function inspectFontBytes(bytes: Uint8Array, limits: AssetInventoryLimits): { mime: 'font/woff' | 'font/woff2' } | null {
   if (bytes.byteLength > limits.maxFontBytes) return null;
   const buffer = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const signature = buffer.toString('ascii', 0, 4);
@@ -707,6 +719,39 @@ async function inspectImage(bytes: Uint8Array, limits: AssetInventoryLimits): Pr
   } catch {
     return null;
   }
+}
+
+async function inspectMigrationAssetBytesWithLimits(
+  bytes: Uint8Array,
+  limits: AssetInventoryLimits,
+): Promise<InspectedMigrationAssetBytes | null> {
+  if (bytes === null || typeof bytes !== 'object' || nodeUtilTypes.isProxy(bytes)) return null;
+  try {
+    if (
+      !(bytes instanceof Uint8Array) ||
+      bytes.byteLength === 0 ||
+      bytes.byteLength > limits.maxSingleBytes
+    ) {
+      return null;
+    }
+    const signature = Buffer.from(
+      bytes.buffer,
+      bytes.byteOffset,
+      Math.min(bytes.byteLength, 4),
+    ).toString('ascii');
+    if (signature === 'wOFF' || signature === 'wOF2') {
+      return inspectFontBytes(bytes, limits);
+    }
+    return await inspectImage(bytes, limits);
+  } catch {
+    return null;
+  }
+}
+
+export async function inspectMigrationAssetBytes(
+  bytes: Uint8Array,
+): Promise<InspectedMigrationAssetBytes | null> {
+  return await inspectMigrationAssetBytesWithLimits(bytes, DEFAULT_LIMITS);
 }
 
 function compareReferences(left: InventoriedAssetReference, right: InventoriedAssetReference): number {
@@ -811,23 +856,30 @@ export async function inventoryMigrationAssets(input: AssetInventoryInput): Prom
     if (previousAuthority !== undefined && previousAuthority !== asset.authority) { block('asset_authority_conflict'); continue; }
     groupAuthorities.set(groupKey, asset.authority);
 
-    const font = asset.structuralKind === 'font' || Buffer.from(asset.bytes.buffer, asset.bytes.byteOffset, Math.min(asset.bytes.byteLength, 4)).toString('ascii').startsWith('wOF');
+    const inspectedBytes = await inspectMigrationAssetBytesWithLimits(asset.bytes, limits);
+    const font = inspectedBytes?.mime === 'font/woff' || inspectedBytes?.mime === 'font/woff2';
     let inspected: Omit<InventoriedAsset, 'digest' | 'bytes' | 'bytesValue' | 'references'> | null;
     if (font) {
       fontCount += 1;
-      const fontMetadata = asset.classification === 'structural_git' ? inspectFont(asset.bytes, asset.fontLicense, limits) : null;
-      inspected = fontMetadata === null ? null : {
-        mime: fontMetadata.mime,
-        encodedWidth: 0,
-        encodedHeight: 0,
-        renderedWidth: 0,
-        renderedHeight: 0,
-        pageCount: 0,
-        animated: false,
-        fontLicense: asset.fontLicense as StructuralFontLicense,
-      };
+      inspected = asset.classification !== 'structural_git' || !validFontLicense(asset.fontLicense)
+        ? null
+        : {
+            mime: inspectedBytes.mime,
+            encodedWidth: 0,
+            encodedHeight: 0,
+            renderedWidth: 0,
+            renderedHeight: 0,
+            pageCount: 0,
+            animated: false,
+            fontLicense: asset.fontLicense as StructuralFontLicense,
+          };
     } else {
-      inspected = await inspectImage(asset.bytes, limits);
+      inspected =
+        asset.structuralKind === 'font' ||
+        inspectedBytes === null ||
+        !('encodedWidth' in inspectedBytes)
+          ? null
+          : inspectedBytes;
     }
     if (fontCount > limits.maxFonts || inspected === null) { block('asset_policy_blocked'); continue; }
     if (asset.authority === 'hosted_source_capture' && !validCaptureReceiptLinkage(asset.captureReceipt, asset.bytes, actualDigest, inspected.mime)) {

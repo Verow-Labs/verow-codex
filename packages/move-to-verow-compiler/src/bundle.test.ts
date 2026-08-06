@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { PassThrough } from 'node:stream';
-import { gunzipSync } from 'node:zlib';
+import { brotliCompressSync, gunzipSync } from 'node:zlib';
 
 import { extract, pack, type Pack } from 'tar-stream';
 import { describe, expect, it } from 'vitest';
@@ -26,6 +26,42 @@ const sha256 = (value: string | Uint8Array): `sha256:${string}` =>
   `sha256:${createHash('sha256').update(value).digest('hex')}`;
 const websiteId = '11111111-1111-4111-8111-111111111111';
 const migrationId = '22222222-2222-4222-8222-222222222222';
+const validPng = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScL7qQAAAABJRU5ErkJggg==',
+  'base64',
+);
+const validPng2x2 = Buffer.from(
+  'iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAACXBIWXMAAAPoAAAD6AG1e1JrAAAAEUlEQVR4nGP4z8DwH4QZYAwAR8oH+WdZbrcAAAAASUVORK5CYII=',
+  'base64',
+);
+function syntheticWoff(): Buffer {
+  const bytes = Buffer.alloc(68);
+  bytes.write('wOFF', 0, 'ascii');
+  bytes.writeUInt32BE(0x0001_0000, 4);
+  bytes.writeUInt32BE(bytes.byteLength, 8);
+  bytes.writeUInt16BE(1, 12);
+  bytes.writeUInt32BE(32, 16);
+  bytes.write('name', 44, 'ascii');
+  bytes.writeUInt32BE(64, 48);
+  bytes.writeUInt32BE(4, 52);
+  bytes.writeUInt32BE(4, 56);
+  return bytes;
+}
+
+function syntheticWoff2Bomb(): Buffer {
+  const body = brotliCompressSync(Buffer.alloc(4));
+  const bytes = Buffer.alloc(50 + body.byteLength);
+  bytes.write('wOF2', 0, 'ascii');
+  bytes.writeUInt32BE(0x0001_0000, 4);
+  bytes.writeUInt32BE(bytes.byteLength, 8);
+  bytes.writeUInt16BE(1, 12);
+  bytes.writeUInt32BE(10_000_004, 16);
+  bytes.writeUInt32BE(body.byteLength, 20);
+  bytes[48] = 5;
+  bytes[49] = 4;
+  body.copy(bytes, 50);
+  return bytes;
+}
 const sourceFiles = [
   makeInventoriedFile('app/page.tsx', encoder.encode('original source\n')),
   makeInventoriedFile('.openai/hosting.json', encoder.encode('{"version":1}\n')),
@@ -55,7 +91,7 @@ function candidateDigest(candidate: readonly { path: string; bytes: Uint8Array }
 function artifacts(
   candidate: readonly { path: string; bytes: Uint8Array; executable: boolean }[] = baseCandidate,
 ): { compiled: CompiledMigrationArtifacts; assetBytes: Uint8Array } {
-  const assetBytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47]);
+  const assetBytes = new Uint8Array(validPng);
   const assetDigest = sha256(assetBytes);
   const identity = { key: 'page.home.hero.image', locale: 'en', variant: null } as const;
   const compileInput: CompileMigrationArtifactsInput = {
@@ -83,6 +119,167 @@ function artifacts(
     policy: { targets: [{ ...identity, required: true, cardinality: 'one', actions: ['edit'], liveVerification: 'route', imagePair: null, collection: null }], collectionPolicy: [] },
   };
   return { compiled: compileMigrationArtifacts(compileInput), assetBytes };
+}
+
+function collectionArtifacts(
+  candidate: readonly { path: string; bytes: Uint8Array; executable: boolean }[] = baseCandidate,
+): CompiledMigrationArtifacts {
+  const target = (
+    key: string,
+    valueType: 'collection' | 'string',
+  ) => ({
+    key,
+    locale: 'en',
+    variant: null,
+    label: `Private ${key}`,
+    sourceKind: 'jsx' as const,
+    valueType,
+    routeId: 'home',
+    sourcePath: 'private/source/page.tsx',
+    sourceAnchor: `ast:${key}`,
+    thirdPartyBoundary: null,
+    owner: 'site_region' as const,
+    structuredFamily: null,
+  });
+  const root = target('page.home.cards', 'collection');
+  const alpha = target('page.home.cards.items.alphaCard.heading', 'string');
+  const beta = target('page.home.cards.items.betaCard.heading', 'string');
+  const policy = (key: string) => ({
+    key,
+    locale: 'en',
+    variant: null,
+    required: true,
+    cardinality: 'one' as const,
+    actions: ['edit' as const],
+    liveVerification: 'route' as const,
+    imagePair: null,
+    collection: null,
+  });
+  return compileMigrationArtifacts({
+    websiteId,
+    migrationId,
+    sourceDigest,
+    candidateDigest: candidateDigest(candidate),
+    cmsNativeProtocol: {
+      package: '@verow/cms-native',
+      version: '1.0.0',
+      contractDigest: sha256('protocol'),
+    },
+    extraction: {
+      status: 'ready',
+      targets: [root, alpha, beta],
+      values: {
+        [`${root.key}\u0000en\u0000`]: { key: root.key, locale: 'en', variant: null, value: '["alpha-card","beta-card"]' },
+        [`${alpha.key}\u0000en\u0000`]: { key: alpha.key, locale: 'en', variant: null, value: 'Alpha' },
+        [`${beta.key}\u0000en\u0000`]: { key: beta.key, locale: 'en', variant: null, value: 'Beta' },
+      },
+      structuredFamilies: [],
+      thirdPartyBoundaries: [],
+      derived: [],
+      structural: [],
+      needsAttention: [],
+    },
+    assets: { status: 'ready', bundled: [], structural: [], external: [], blockers: [] },
+    routes: [{ routeId: 'home', path: '/', renderedSource: 'page.home' }],
+    policy: {
+      targets: [policy(root.key), policy(alpha.key), policy(beta.key)],
+      collectionPolicy: [{
+        key: root.key,
+        locale: 'en',
+        variant: null,
+        minimumItems: 1,
+        maximumItems: 4,
+        requiredItemIds: ['alpha-card'],
+      }],
+    },
+  });
+}
+
+function pairedImageArtifacts(
+  candidate: readonly { path: string; bytes: Uint8Array; executable: boolean }[] = baseCandidate,
+): { compiled: CompiledMigrationArtifacts; assetBytes: Uint8Array } {
+  const assetBytes = new Uint8Array(validPng);
+  const assetDigest = sha256(assetBytes);
+  const image = { key: 'page.home.hero.image', locale: 'en', variant: null } as const;
+  const alt = { key: 'page.home.hero.alt', locale: 'en', variant: null } as const;
+  const target = (identity: typeof image | typeof alt, valueType: 'image' | 'string') => ({
+    ...identity,
+    label: `Private ${identity.key}`,
+    sourceKind: 'jsx' as const,
+    valueType,
+    routeId: 'home',
+    sourcePath: 'private/source/page.tsx',
+    sourceAnchor: `ast:${identity.key}`,
+    thirdPartyBoundary: null,
+    owner: 'site_region' as const,
+    structuredFamily: null,
+  });
+  const policy = (identity: typeof image | typeof alt, role: 'image' | 'alt', pair: typeof image | typeof alt) => ({
+    ...identity,
+    required: true,
+    cardinality: 'one' as const,
+    actions: ['edit' as const],
+    liveVerification: 'route' as const,
+    imagePair: { role, target: pair },
+    collection: null,
+  });
+  return {
+    assetBytes,
+    compiled: compileMigrationArtifacts({
+      websiteId,
+      migrationId,
+      sourceDigest,
+      candidateDigest: candidateDigest(candidate),
+      cmsNativeProtocol: {
+        package: '@verow/cms-native',
+        version: '1.0.0',
+        contractDigest: sha256('protocol'),
+      },
+      extraction: {
+        status: 'ready',
+        targets: [target(image, 'image'), target(alt, 'string')],
+        values: {
+          [`${image.key}\u0000en\u0000`]: { ...image, value: assetDigest },
+          [`${alt.key}\u0000en\u0000`]: { ...alt, value: 'Synthetic alt' },
+        },
+        structuredFamilies: [],
+        thirdPartyBoundaries: [],
+        derived: [],
+        structural: [],
+        needsAttention: [],
+      },
+      assets: {
+        status: 'ready',
+        bundled: [{
+          digest: assetDigest,
+          bytes: assetBytes.byteLength,
+          bytesValue: assetBytes,
+          mime: 'image/png',
+          encodedWidth: 1,
+          encodedHeight: 1,
+          renderedWidth: 1,
+          renderedHeight: 1,
+          pageCount: 1,
+          animated: false,
+          references: [{
+            id: 'hero',
+            sourcePath: 'public/hero.png',
+            target: image,
+            classification: 'editorial_cms',
+            provenance: { authority: 'source_local', sourcePath: 'public/hero.png' },
+          }],
+        }],
+        structural: [],
+        external: [],
+        blockers: [],
+      },
+      routes: [{ routeId: 'home', path: '/', renderedSource: 'page.home' }],
+      policy: {
+        targets: [policy(image, 'image', alt), policy(alt, 'alt', image)],
+        collectionPolicy: [],
+      },
+    }),
+  };
 }
 
 function input(overrides: Partial<CreateMigrationBundleInput> = {}): CreateMigrationBundleInput {
@@ -450,6 +647,55 @@ describe('deterministic migration bundle', () => {
     await expect(createMigrationBundle(invalid)).rejects.toThrow(/^bundle_contract_invalid$/u);
   });
 
+  it('revalidates collection fixture JSON, policy bounds, and exact stable-id child closure', async () => {
+    const compiled = collectionArtifacts();
+    await expect(createMigrationBundle(input({ artifacts: compiled, editorialAssets: [] }))).resolves.toBeDefined();
+
+    for (const rootValue of [
+      'not-json',
+      '[]',
+      '["alpha-card","alpha-card"]',
+      '["beta-card","alpha-card"]',
+    ]) {
+      const invalid = input({ artifacts: structuredClone(compiled), editorialAssets: [] });
+      invalid.artifacts.contentFixture.values.find(({ key }) => key === 'page.home.cards')!.value = rootValue;
+      relinkArtifactDigests(invalid.artifacts);
+      await expect(createMigrationBundle(invalid)).rejects.toThrow(/^bundle_contract_invalid$/u);
+    }
+
+    const missingChild = input({ artifacts: structuredClone(compiled), editorialAssets: [] });
+    const betaKey = 'page.home.cards.items.betaCard.heading';
+    missingChild.artifacts.contentFixture.values = missingChild.artifacts.contentFixture.values.filter(
+      ({ key }) => key !== betaKey,
+    );
+    missingChild.artifacts.privateManifest.targets = missingChild.artifacts.privateManifest.targets.filter(
+      ({ key }) => key !== betaKey,
+    );
+    missingChild.artifacts.repositoryBinding.bindings = missingChild.artifacts.repositoryBinding.bindings.filter(
+      ({ key }) => key !== betaKey,
+    );
+    missingChild.artifacts.runtimeExpectation.counts.editableTargets -= 1;
+    relinkArtifactDigests(missingChild.artifacts);
+    await expect(createMigrationBundle(missingChild)).rejects.toThrow(/^bundle_contract_invalid$/u);
+  });
+
+  it('requires inferred image and alt targets to retain reciprocal Task 4 pairing', async () => {
+    const paired = pairedImageArtifacts();
+    const valid = input({
+      artifacts: paired.compiled,
+      editorialAssets: [{
+        digest: paired.compiled.contentFixture.editorialAssets[0]!.digest,
+        bytes: paired.assetBytes,
+      }],
+    });
+    await expect(createMigrationBundle(valid)).resolves.toBeDefined();
+
+    const invalid = structuredClone(valid);
+    for (const target of invalid.artifacts.privateManifest.targets) target.imagePair = null;
+    relinkArtifactDigests(invalid.artifacts);
+    await expect(createMigrationBundle(invalid)).rejects.toThrow(/^bundle_contract_invalid$/u);
+  });
+
   it('rejects missing, extra, duplicate, mismatched, external and structural editorial blobs', async () => {
     const valid = input();
     const digest = valid.editorialAssets[0]!.digest;
@@ -630,7 +876,9 @@ describe('deterministic migration bundle', () => {
   });
 
   it('requires structural references to close over exact candidate bytes', async () => {
-    const structuralBytes = encoder.encode('<svg xmlns="http://www.w3.org/2000/svg"/>');
+    const structuralBytes = encoder.encode(
+      '<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"><rect width="1" height="1"/></svg>',
+    );
     const structuralPath = 'public/mark.svg';
     const candidate = [
       ...baseCandidate,
@@ -657,8 +905,8 @@ describe('deterministic migration bundle', () => {
     wrong.candidate.find(({ path }) => path === structuralPath)!.bytes = encoder.encode('<svg/>');
     await expect(createMigrationBundle(wrong)).rejects.toThrow(/^bundle_contract_invalid$/u);
 
-    const fontBytes = new Uint8Array([0x77, 0x4f, 0x46, 0x32, 1, 2, 3, 4]);
-    const fontPath = 'public/font.woff2';
+    const fontBytes = new Uint8Array(syntheticWoff());
+    const fontPath = 'public/font.woff';
     const fontCandidate = [
       ...baseCandidate,
       { path: fontPath, bytes: fontBytes, executable: false },
@@ -671,7 +919,7 @@ describe('deterministic migration bundle', () => {
     unclosedFont.artifacts.privateManifest.structuralAssets = [
       {
         digest: sha256(fontBytes),
-        mime: 'font/woff2',
+        mime: 'font/woff',
         references: [{ id: 'brand-font', sourcePath: fontPath }],
       },
     ];
@@ -708,7 +956,7 @@ describe('deterministic migration bundle', () => {
   });
 
   it('allows inspected binary assets by Task 4 digest/mime and requires SVG structural closure', async () => {
-    const pngBytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    const pngBytes = new Uint8Array(validPng2x2);
     const binaryCandidate = [
       ...baseCandidate,
       { path: 'public/brand.data', bytes: pngBytes, executable: false },
@@ -725,7 +973,9 @@ describe('deterministic migration bundle', () => {
     relinkArtifactDigests(allowed.artifacts);
     await expect(createMigrationBundle(allowed)).resolves.toBeDefined();
 
-    const svgBytes = encoder.encode('<svg xmlns="http://www.w3.org/2000/svg"><path d="M0 0"/></svg>');
+    const svgBytes = encoder.encode(
+      '<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"><path d="M0 0"/></svg>',
+    );
     const svgCandidate = [
       ...baseCandidate,
       { path: 'public/decorative.svg', bytes: svgBytes, executable: false },
@@ -739,6 +989,50 @@ describe('deterministic migration bundle', () => {
     }];
     relinkArtifactDigests(missing.artifacts);
     await expect(createMigrationBundle(missing)).resolves.toBeDefined();
+  });
+
+  it('rejects editorial blobs that fail the exact Task 4 image-byte inspection', async () => {
+    const malformedWoff = Buffer.alloc(68);
+    malformedWoff.write('wOFF', 0, 'ascii');
+    for (const bytes of [
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>'),
+      malformedWoff,
+      syntheticWoff2Bomb(),
+    ]) {
+      const invalid = input();
+      const digest = sha256(bytes);
+      invalid.editorialAssets = [{ digest, bytes: new Uint8Array(bytes) }];
+      invalid.artifacts.contentFixture.editorialAssets[0]!.digest = digest;
+      invalid.artifacts.contentFixture.values[0]!.value = digest;
+      invalid.artifacts.privateManifest.targets[0]!.editorialAssetDigest = digest;
+      relinkArtifactDigests(invalid.artifacts);
+      await expect(createMigrationBundle(invalid)).rejects.toThrow(/^bundle_contract_invalid$/u);
+    }
+  });
+
+  it('rejects malformed structural raster, SVG, and font bytes through the Task 4 inspector', async () => {
+    const malformedWoff = Buffer.alloc(68);
+    malformedWoff.write('wOFF', 0, 'ascii');
+    const cases = [
+      ['public/malformed.png', Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), 'image/png'],
+      ['public/script.svg', Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>'), 'image/svg+xml'],
+      ['public/external.svg', Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"><use href="https://example.test/x.svg#x"/></svg>'), 'image/svg+xml'],
+      ['public/malformed.woff', malformedWoff, 'font/woff'],
+      ['public/bomb.woff2', syntheticWoff2Bomb(), 'font/woff2'],
+      ['public/mime-mismatch.data', validPng2x2, 'image/jpeg'],
+    ] as const;
+    for (const [path, bytes, mime] of cases) {
+      const candidate = [...baseCandidate, { path, bytes: new Uint8Array(bytes), executable: false }];
+      const invalid = input({ candidate, artifacts: artifacts(candidate).compiled });
+      invalid.artifacts.privateManifest.structuralAssets = [{
+        digest: sha256(bytes),
+        mime,
+        references: [{ id: 'structural-test', sourcePath: path }],
+      }];
+      relinkArtifactDigests(invalid.artifacts);
+      await expect(createMigrationBundle(invalid)).rejects.toThrow(/^bundle_contract_invalid$/u);
+    }
   });
 
   it('allows legitimate third-party HTTPS text while preserving namespace separation', async () => {
@@ -808,6 +1102,79 @@ describe('deterministic migration bundle', () => {
     invalid.artifacts.privateManifest.structuredFamilies = families;
     await expect(createMigrationBundle(invalid)).rejects.toThrow(/^bundle_input_invalid$/u);
     expect(getterCalls).toBe(0);
+  });
+
+  it('preflights every Task 4 scalar without coercing accessors, proxies, or exotic primitives', async () => {
+    const secret = 'SYNTHETIC_PRIVATE_ARTIFACT_COERCION';
+    let observerCalls = 0;
+    const observer = {
+      [Symbol.toPrimitive]() {
+        observerCalls += 1;
+        throw new Error(secret);
+      },
+    };
+    const proxied = new Proxy({}, {
+      get() {
+        observerCalls += 1;
+        throw new Error(secret);
+      },
+    });
+    const revoked = Proxy.revocable({}, {});
+    revoked.revoke();
+    const accessor = Object.defineProperty({ path: 'private/source/page.tsx' }, 'anchor', {
+      enumerable: true,
+      get() {
+        observerCalls += 1;
+        throw new Error(secret);
+      },
+    });
+    const invalid = [
+      (() => {
+        const value = input();
+        value.artifacts.contentFixture.websiteId = Symbol(secret) as never;
+        return value;
+      })(),
+      (() => {
+        const value = input();
+        value.artifacts.contentFixture.websiteId = 1n as never;
+        return value;
+      })(),
+      (() => {
+        const value = input();
+        value.artifacts.privateManifest.targets[0]!.label = (() => secret) as never;
+        return value;
+      })(),
+      (() => {
+        const value = input();
+        value.artifacts.contentFixture.websiteId = observer as never;
+        return value;
+      })(),
+      (() => {
+        const value = input();
+        value.artifacts.contentFixture.websiteId = proxied as never;
+        return value;
+      })(),
+      (() => {
+        const value = input();
+        value.artifacts.contentFixture.websiteId = revoked.proxy as never;
+        return value;
+      })(),
+      (() => {
+        const value = input();
+        value.artifacts.privateManifest.targets[0]!.sourceEvidence = accessor as never;
+        return value;
+      })(),
+    ];
+    for (const value of invalid) {
+      try {
+        await createMigrationBundle(value);
+        throw new Error('expected rejection');
+      } catch (error) {
+        expect(String(error)).toBe('Error: bundle_input_invalid');
+        expect(String(error)).not.toContain(secret);
+      }
+    }
+    expect(observerCalls).toBe(0);
   });
 
   it('copies every admitted byte before asynchronous work', async () => {

@@ -76,6 +76,24 @@ describe('migration archive admission policy', () => {
     'config/service-account.json',
     'config/service_account_key.json',
     'config/service-account-credentials.json',
+    '.git-credentials',
+    '.ssh/id_rsa.pub',
+    'keys/id_ecdsa',
+    'keys/id_dsa',
+    '.docker/config.json',
+    'config/access_token',
+    'config/private-key',
+    'config/github-token',
+    'config/stripe-secret',
+    'config/aws_credentials',
+    'config/google-service-account',
+    'fixture.zst',
+    'bundle.tar.zst',
+    'bundle.tar.zstd',
+    'fixture.lz4',
+    'fixture.cab',
+    'fixture.cpio',
+    'fixture.pdf',
   ])('rejects forbidden candidate path %s with a content-free code', (path) => {
     expect(() => assertArchiveEntries([entry(path)])).toThrow(/^bundle_entry_forbidden$/u);
   });
@@ -88,6 +106,9 @@ describe('migration archive admission policy', () => {
         entry('people/secretary.ts'),
         entry('styles/keyframes.css'),
         entry('lib/api-client.ts'),
+        entry('config/site.json'),
+        entry('config/theme.yaml'),
+        entry('docker/config.example.json'),
       ]),
     ).not.toThrow();
   });
@@ -150,10 +171,34 @@ describe('migration archive admission policy', () => {
       ['renamed-7z.txt', new Uint8Array([0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c])],
       ['renamed-xz.txt', new Uint8Array([0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00])],
       ['renamed-tar.txt', tarBytes],
+      ['renamed-zstd.txt', new Uint8Array([0x28, 0xb5, 0x2f, 0xfd])],
+      ['renamed-skippable-frame.txt', new Uint8Array([0x50, 0x2a, 0x4d, 0x18])],
+      ['renamed-lz4.txt', new Uint8Array([0x04, 0x22, 0x4d, 0x18])],
+      ['renamed-legacy-lz4.txt', new Uint8Array([0x02, 0x21, 0x4c, 0x18])],
+      ['renamed-cab.txt', new TextEncoder().encode('MSCFsynthetic')],
+      ['renamed-ar.txt', new TextEncoder().encode('!<arch>\nsynthetic')],
+      ['renamed-thin-ar.txt', new TextEncoder().encode('!<thin>\nsynthetic')],
+      ['renamed-cpio-newc.txt', new TextEncoder().encode('070701synthetic')],
+      ['renamed-cpio-crc.txt', new TextEncoder().encode('070702synthetic')],
+      ['renamed-cpio-old.txt', new TextEncoder().encode('070707synthetic')],
+      ['renamed-pdf.txt', new TextEncoder().encode('%PDF-1.7 synthetic')],
     ] as const) {
       expect(() => assertArchiveEntries([entry(path, { bytes: content })])).toThrow(
         /^bundle_entry_forbidden$/u,
       );
+    }
+  });
+
+  it('does not reject truncated or adjacent blocked-format signatures as magic', () => {
+    for (const content of [
+      new Uint8Array([0x28, 0xb5, 0x2f]),
+      new Uint8Array([0x28, 0xb5, 0x2f, 0xfc]),
+      new TextEncoder().encode('MSCE synthetic text'),
+      new TextEncoder().encode('!<arch synthetic text'),
+      new TextEncoder().encode('070700 synthetic text'),
+      new TextEncoder().encode('%PDE-1.7 synthetic text'),
+    ]) {
+      expect(() => assertArchiveEntries([entry('format-neighbor.txt', { bytes: content })])).not.toThrow();
     }
   });
 
