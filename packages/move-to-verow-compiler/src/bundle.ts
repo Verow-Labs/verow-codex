@@ -7,11 +7,11 @@ import type { Pack } from 'tar-stream';
 import {
   assertArchiveEntries,
   assertSafeRelativePath,
+  classifySupportedCandidateAsset,
   compareUtf8,
   copyArchiveEntries,
   isSafeByteArray,
   resolveArchiveLimits,
-  supportedCandidateAssetMime,
   type ArchiveLimits,
   type BundleEntryInput,
 } from './archive-policy.js';
@@ -1304,9 +1304,9 @@ async function assertArtifactContracts(
   }
   for (const entry of candidate) {
     const structuralMime = structuralMimeByPath.get(entry.path);
-    const supportedAssetMime = supportedCandidateAssetMime(entry.path);
-    if (supportedAssetMime !== null) {
-      if (structuralMime !== supportedAssetMime) fail('bundle_contract_invalid');
+    const supportedAsset = classifySupportedCandidateAsset(entry.path);
+    if (supportedAsset !== null) {
+      if (structuralMime !== supportedAsset.mime) fail('bundle_contract_invalid');
       continue;
     }
     if (structuralMime !== undefined) continue;

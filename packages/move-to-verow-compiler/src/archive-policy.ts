@@ -203,6 +203,10 @@ const CREDENTIAL_SENSITIVE_TOKENS = new Set([
   'credentials',
   'key',
   'keys',
+  'passphrase',
+  'passphrases',
+  'password',
+  'passwords',
   'secret',
   'secrets',
   'token',
@@ -219,10 +223,14 @@ const CREDENTIAL_COMPOUND_PREFIXES = [
   'bearer',
   'client',
   'cloudflare',
+  'database',
+  'db',
+  'encryption',
   'firebase',
   'github',
   'gitlab',
   'google',
+  'master',
   'netlify',
   'npm',
   'oauth',
@@ -233,18 +241,21 @@ const CREDENTIAL_COMPOUND_PREFIXES = [
   'sendgrid',
   'service',
   'session',
+  'signing',
   'stripe',
   'supabase',
+  'user',
   'vercel',
 ] as const;
-const CREDENTIAL_COMPOUNDS = new Map<string, readonly [string, string]>([
-  ...CREDENTIAL_COMPOUND_PREFIXES.flatMap((prefix) =>
-    [...CREDENTIAL_SENSITIVE_TOKENS].map(
-      (sensitive) => [`${prefix}${sensitive}`, [prefix, sensitive] as const] as const,
-    ),
-  ),
-  ['serviceaccount', ['service', 'account'] as const],
-]);
+const CREDENTIAL_COMPOUND_WORDS = [...new Set([
+  ...CREDENTIAL_COMPOUND_PREFIXES,
+  ...CREDENTIAL_SENSITIVE_TOKENS,
+  'account',
+  'design',
+  'id',
+])].sort((left, right) => right.length - left.length || compareUtf8(left, right));
+const MAX_CREDENTIAL_COMPOUND_CHARACTERS = 80;
+const MAX_CREDENTIAL_COMPOUND_WORDS = 8;
 const SUPPORTED_CANDIDATE_ASSET_MIMES = Object.freeze({
   avif: 'image/avif',
   gif: 'image/gif',
@@ -305,6 +316,11 @@ const BLOCKED_FORMATS: readonly BlockedFormat[] = [
 ];
 const UNSAFE_BINARY_PATTERN = /(?:\.bin|\.class|\.com|\.dll|\.dylib|\.exe|\.ico|\.msi|\.node|\.so|\.wasm)$/iu;
 const EXECUTABLE_EXTENSIONS = new Set(['.cjs', '.js', '.mjs', '.sh', '.ts']);
+
+export interface SupportedCandidateAssetClassification {
+  suffix: keyof typeof SUPPORTED_CANDIDATE_ASSET_MIMES;
+  mime: (typeof SUPPORTED_CANDIDATE_ASSET_MIMES)[keyof typeof SUPPORTED_CANDIDATE_ASSET_MIMES];
+}
 
 function fail(code: 'bundle_entry_forbidden' | 'bundle_input_invalid' | 'bundle_limit_exceeded'): never {
   throw new Error(code);
@@ -390,15 +406,42 @@ function extension(path: string): string {
   return dot < 0 ? '' : name.slice(dot).toLowerCase();
 }
 
-export function supportedCandidateAssetMime(path: string): string | null {
-  const suffix = extension(path).slice(1);
-  return Object.hasOwn(SUPPORTED_CANDIDATE_ASSET_MIMES, suffix)
-    ? SUPPORTED_CANDIDATE_ASSET_MIMES[suffix as keyof typeof SUPPORTED_CANDIDATE_ASSET_MIMES]
-    : null;
+export function classifySupportedCandidateAsset(
+  path: string,
+): SupportedCandidateAssetClassification | null {
+  const basename = path.slice(path.lastIndexOf('/') + 1).normalize('NFKC').toLowerCase();
+  const dot = basename.lastIndexOf('.');
+  const suffix = dot < 0 ? '' : basename.slice(dot + 1);
+  if (!Object.hasOwn(SUPPORTED_CANDIDATE_ASSET_MIMES, suffix)) return null;
+  const supportedSuffix = suffix as keyof typeof SUPPORTED_CANDIDATE_ASSET_MIMES;
+  return { suffix: supportedSuffix, mime: SUPPORTED_CANDIDATE_ASSET_MIMES[supportedSuffix] };
 }
 
 function hasPathSuffix(path: string, suffix: string): boolean {
   return path === suffix || path.endsWith(`/${suffix}`);
+}
+
+function segmentCredentialCompound(token: string): string[] | null {
+  if (token.length === 0 || token.length > MAX_CREDENTIAL_COMPOUND_CHARACTERS) return null;
+  const memo = new Map<string, string[] | null>();
+  function visit(offset: number, remainingWords: number): string[] | null {
+    if (offset === token.length) return [];
+    if (remainingWords === 0) return null;
+    const cacheKey = `${offset}\u0000${remainingWords}`;
+    if (memo.has(cacheKey)) return memo.get(cacheKey) ?? null;
+    for (const word of CREDENTIAL_COMPOUND_WORDS) {
+      if (!token.startsWith(word, offset)) continue;
+      const suffix = visit(offset + word.length, remainingWords - 1);
+      if (suffix !== null) {
+        const result = [word, ...suffix];
+        memo.set(cacheKey, result);
+        return result;
+      }
+    }
+    memo.set(cacheKey, null);
+    return null;
+  }
+  return visit(0, MAX_CREDENTIAL_COMPOUND_WORDS);
 }
 
 function tokenizeCredentialBasename(name: string): string[] {
@@ -409,7 +452,7 @@ function tokenizeCredentialBasename(name: string): string[] {
   return canonical
     .split(/[\p{P}\p{Z}\s]+/u)
     .filter(Boolean)
-    .flatMap((token) => CREDENTIAL_COMPOUNDS.get(token) ?? [token]);
+    .flatMap((token) => segmentCredentialCompound(token) ?? [token]);
 }
 
 function consumedBenignCredentialTokens(tokens: readonly string[]): Set<number> {
@@ -430,15 +473,17 @@ function consumedBenignCredentialTokens(tokens: readonly string[]): Set<number> 
 
 function hasCredentialBasename(name: string): boolean {
   const compatibilityName = name.normalize('NFKC');
-  if (supportedCandidateAssetMime(compatibilityName) !== null) return false;
+  if (classifySupportedCandidateAsset(compatibilityName) !== null) return false;
   const dot = compatibilityName.lastIndexOf('.');
   const finalExtension = dot > 0 ? compatibilityName.slice(dot + 1).toLowerCase() : '';
   let classifiedName = compatibilityName;
   if (CREDENTIAL_SOURCE_EXTENSIONS.has(finalExtension)) {
     const preSourceName = compatibilityName.slice(0, dot);
-    const innerDot = preSourceName.lastIndexOf('.');
-    const innerExtension = innerDot > 0 ? preSourceName.slice(innerDot + 1).toLowerCase() : '';
-    if (!CREDENTIAL_INNER_RISK_EXTENSIONS.has(innerExtension)) return false;
+    const hasRiskyInnerExtension = preSourceName
+      .split('.')
+      .slice(1)
+      .some((suffix) => CREDENTIAL_INNER_RISK_EXTENSIONS.has(suffix.toLowerCase()));
+    if (!hasRiskyInnerExtension) return false;
     classifiedName = preSourceName;
   }
   const tokens = tokenizeCredentialBasename(classifiedName);

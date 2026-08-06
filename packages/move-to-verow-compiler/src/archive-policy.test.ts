@@ -291,9 +291,22 @@ describe('migration archive admission policy', () => {
   });
 
   it.each([
+    'config/credentials.json.test.ts',
+    'config/private-key.pem.spec.ts',
+    'config/secrets.env.generated.js',
+    'config/access-token.yaml.client.mjs',
+    'config/keys.toml.fixture.tsx',
+    'config/auth-token.db.browser.jsx',
+    'config/token.txt.module.css',
+  ])('rejects risky suffix %s anywhere in the pre-source dotted chain', (path) => {
+    expect(() => assertArchiveEntries([entry(path)])).toThrow(/^bundle_entry_forbidden$/u);
+  });
+
+  it.each([
     'src/auth-token.js',
-    'src/foo.schema.ts',
-    'src/button.stories.tsx',
+    'src/foo.test.ts',
+    'src/component.stories.tsx',
+    'src/schema.ts',
     'src/credential-form.test.ts',
   ])('preserves ordinary reviewed source filename %s without a risky inner suffix', (path) => {
     expect(() => assertArchiveEntries([entry(path)])).not.toThrow();
@@ -324,9 +337,36 @@ describe('migration archive admission policy', () => {
   });
 
   it.each([
+    'config/SECRETKEY',
+    'config/SECRETKEYS',
+    'config/MASTERKEY',
+    'config/ENCRYPTIONKEY',
+    'config/SIGNINGKEY',
+    'config/PASSWORD',
+    'config/PASSWORDS',
+    'config/PASSPHRASE',
+    'config/PASSPHRASES',
+    'config/MASTERPASSPHRASE',
+    'config/DBPASSWORD',
+    'config/DATABASEPASSWORD',
+    'config/USERPASSWORD',
+    'config/OPENAIAPIKEY',
+    'config/AWSACCESSKEYID',
+    'config/SERVICEACCOUNTKEY',
+    'config/DESIGNTOKENSECRET',
+  ])('rejects exact full-token credential segmentation for %s', (path) => {
+    expect(() => assertArchiveEntries([entry(path)])).toThrow(/^bundle_entry_forbidden$/u);
+  });
+
+  it.each([
     'config/MONKEY.json',
     'config/KEYBOARD.yaml',
     'config/APIKEYBOARD.toml',
+    'config/KEYNOTE',
+    'config/PASSWORDLESS',
+    'config/SECRETARYKEY',
+    'config/MASTERKEYBOARD',
+    'config/KEYSTONE',
   ])('admits uppercase near-neighbor %s that is not an exact credential compound', (path) => {
     expect(() => assertArchiveEntries([entry(path)])).not.toThrow();
   });
@@ -342,6 +382,13 @@ describe('migration archive admission policy', () => {
     'public/token.woff',
     'public/private-key.woff2',
   ])('defers supported candidate asset filename %s to structural validation', (path) => {
+    expect(() => assertArchiveEntries([entry(path)])).not.toThrow();
+  });
+
+  it.each([
+    'public/key．png',
+    'public/token.ＰＮＧ',
+  ])('canonically defers compatibility asset suffix %s to structural validation', (path) => {
     expect(() => assertArchiveEntries([entry(path)])).not.toThrow();
   });
 

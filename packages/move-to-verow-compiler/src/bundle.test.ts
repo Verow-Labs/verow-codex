@@ -1072,6 +1072,40 @@ describe('deterministic migration bundle', () => {
     }
   });
 
+  it.each([
+    'public/key．png',
+    'public/token.ＰＮＧ',
+  ])('uses canonical asset suffix classification for exact structural closure at %s', async (path) => {
+    const pngBytes = new Uint8Array(validPng2x2);
+    const candidate = [...baseCandidate, { path, bytes: pngBytes, executable: false }];
+    const valid = input({ candidate, artifacts: artifacts(candidate).compiled });
+    valid.artifacts.privateManifest.structuralAssets = [{
+      digest: sha256(pngBytes),
+      mime: 'image/png',
+      references: [{ id: 'canonical-supported-asset', sourcePath: path }],
+    }];
+    relinkArtifactDigests(valid.artifacts);
+    await expect(createMigrationBundle(valid)).resolves.toBeDefined();
+
+    const unclaimed = input({ candidate, artifacts: artifacts(candidate).compiled });
+    await expect(createMigrationBundle(unclaimed)).rejects.toThrow(/^bundle_contract_invalid$/u);
+
+    const textBytes = encoder.encode('synthetic source text');
+    const textCandidate = [...baseCandidate, { path, bytes: textBytes, executable: false }];
+    await expect(
+      createMigrationBundle(input({ candidate: textCandidate, artifacts: artifacts(textCandidate).compiled })),
+    ).rejects.toThrow(/^bundle_contract_invalid$/u);
+
+    const malformed = input({ candidate: textCandidate, artifacts: artifacts(textCandidate).compiled });
+    malformed.artifacts.privateManifest.structuralAssets = [{
+      digest: sha256(textBytes),
+      mime: 'image/png',
+      references: [{ id: 'malformed-canonical-asset', sourcePath: path }],
+    }];
+    relinkArtifactDigests(malformed.artifacts);
+    await expect(createMigrationBundle(malformed)).rejects.toThrow(/^bundle_contract_invalid$/u);
+  });
+
   it('keeps unsupported ICO candidates blocked end to end', async () => {
     const candidate = [
       ...baseCandidate,
