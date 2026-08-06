@@ -163,6 +163,10 @@ export function canonicalDigest(value: unknown): `sha256:${string}` {
   return sha256(canonicalJson(value, new Set()));
 }
 
+export function canonicalJsonBytes(value: unknown): Uint8Array {
+  return Buffer.from(canonicalJson(value, new Set()), 'utf8');
+}
+
 const digestPattern = /^sha256:[0-9a-f]{64}$/u;
 const payloadIndexKeys = ['entries', 'version'];
 const payloadEntryKeys = ['bytes', 'digest', 'mode', 'path'];

@@ -12,6 +12,7 @@ export {
 export {
   bundleContractProvenance,
   canonicalDigest,
+  canonicalJsonBytes,
   canonicalDigestVectors,
   validateBundleDescriptor,
   validatePayloadIndex,
@@ -19,6 +20,40 @@ export {
   type CanonicalDigestVector,
   type ContractValidationResult,
 } from './bundle-contract.js';
+export {
+  ARCHIVE_LIMITS,
+  assertArchiveEntries,
+  type ArchiveLimits,
+  type BundleEntryInput,
+} from './archive-policy.js';
+export {
+  ARCHIVE_FORMAT,
+  BUNDLE_CAPABILITY_CLAIMS,
+  BUNDLE_FORMAT,
+  CAPABILITY_CLAIMS_FORMAT,
+  DEPENDENCY_INVENTORY_FORMAT,
+  EVIDENCE_INDEX_FORMAT,
+  PAYLOAD_INDEX_FORMAT,
+  SOURCE_INVENTORY_FORMAT,
+  createMigrationBundle,
+  type BundleCapabilityClaim,
+  type BundleEvidenceInput,
+  type BundleLimits,
+  type BundleLogicalValue,
+  type CapabilityClaimsV1,
+  type CreatedMigrationBundle,
+  type CreateMigrationBundleInput,
+  type DependencyInventoryRecordV1,
+  type DependencyInventoryV1,
+  type EditorialAssetBlobInput,
+  type EvidenceIndexEntryV1,
+  type EvidenceIndexV1,
+  type MigrationBundleManifestV1,
+  type MigrationPayloadIndexEntryV1,
+  type MigrationPayloadIndexV1,
+  type SourceInventoryFileV1,
+  type SourceInventoryV1,
+} from './bundle.js';
 export {
   convertToNativeNext,
   type ConvertToNativeNextInput,

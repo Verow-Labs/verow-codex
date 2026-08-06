@@ -5,6 +5,7 @@ import { describe, expect, it } from 'vitest';
 import {
   bundleContractProvenance,
   canonicalDigest,
+  canonicalJsonBytes,
   canonicalDigestVectors,
   validateBundleDescriptor,
   validatePayloadIndex,
@@ -197,6 +198,12 @@ describe('reviewed webapp bundle contract', () => {
       expect(() => canonicalDigest(invalid)).toThrow('logical canonical JSON');
     }
     expect(getterCalls).toBe(0);
+  });
+
+  it('exposes the reviewed canonical serialization bytes used by logical bundle files', () => {
+    expect(new TextDecoder().decode(canonicalJsonBytes({ z: 2, a: ['é', 1] }))).toBe(
+      '{"a":["é",1],"z":2}',
+    );
   });
 
   it('verifies the schema digest file bytes against provenance', () => {
