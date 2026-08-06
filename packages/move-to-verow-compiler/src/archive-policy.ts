@@ -112,6 +112,41 @@ const CREDENTIAL_SOURCE_EXTENSIONS = new Set([
   'ts',
   'tsx',
 ]);
+const CREDENTIAL_INNER_RISK_EXTENSIONS = new Set([
+  'cer',
+  'cert',
+  'cfg',
+  'cnf',
+  'conf',
+  'config',
+  'crt',
+  'csv',
+  'db',
+  'der',
+  'env',
+  'ini',
+  'jks',
+  'json',
+  'jsonc',
+  'key',
+  'keystore',
+  'npmrc',
+  'p12',
+  'pem',
+  'pfx',
+  'properties',
+  'pypirc',
+  'sql',
+  'sqlite',
+  'sqlite3',
+  'tfstate',
+  'toml',
+  'tsv',
+  'txt',
+  'xml',
+  'yaml',
+  'yml',
+]);
 const CREDENTIAL_SINGLETON_TOKENS = new Set([
   'auth',
   'credential',
@@ -173,6 +208,54 @@ const CREDENTIAL_SENSITIVE_TOKENS = new Set([
   'token',
   'tokens',
 ]);
+const CREDENTIAL_COMPOUND_PREFIXES = [
+  'access',
+  'api',
+  'auth',
+  'authentication',
+  'authorization',
+  'aws',
+  'azure',
+  'bearer',
+  'client',
+  'cloudflare',
+  'firebase',
+  'github',
+  'gitlab',
+  'google',
+  'netlify',
+  'npm',
+  'oauth',
+  'openai',
+  'private',
+  'refresh',
+  'sanity',
+  'sendgrid',
+  'service',
+  'session',
+  'stripe',
+  'supabase',
+  'vercel',
+] as const;
+const CREDENTIAL_COMPOUNDS = new Map<string, readonly [string, string]>([
+  ...CREDENTIAL_COMPOUND_PREFIXES.flatMap((prefix) =>
+    [...CREDENTIAL_SENSITIVE_TOKENS].map(
+      (sensitive) => [`${prefix}${sensitive}`, [prefix, sensitive] as const] as const,
+    ),
+  ),
+  ['serviceaccount', ['service', 'account'] as const],
+]);
+const SUPPORTED_CANDIDATE_ASSET_MIMES = Object.freeze({
+  avif: 'image/avif',
+  gif: 'image/gif',
+  jpeg: 'image/jpeg',
+  jpg: 'image/jpeg',
+  png: 'image/png',
+  svg: 'image/svg+xml',
+  webp: 'image/webp',
+  woff: 'font/woff',
+  woff2: 'font/woff2',
+} as const);
 const PDF_PREFIX_WHITESPACE = new Set([0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x20]);
 interface BlockedFormat {
   extensions: readonly string[];
@@ -220,7 +303,7 @@ const BLOCKED_FORMATS: readonly BlockedFormat[] = [
   ] },
   { extensions: ['.pdf'], signatures: [{ offset: 0, bytes: [0x25, 0x50, 0x44, 0x46, 0x2d] }] },
 ];
-const UNSAFE_BINARY_PATTERN = /(?:\.bin|\.class|\.com|\.dll|\.dylib|\.exe|\.msi|\.node|\.so|\.wasm)$/iu;
+const UNSAFE_BINARY_PATTERN = /(?:\.bin|\.class|\.com|\.dll|\.dylib|\.exe|\.ico|\.msi|\.node|\.so|\.wasm)$/iu;
 const EXECUTABLE_EXTENSIONS = new Set(['.cjs', '.js', '.mjs', '.sh', '.ts']);
 
 function fail(code: 'bundle_entry_forbidden' | 'bundle_input_invalid' | 'bundle_limit_exceeded'): never {
@@ -307,23 +390,26 @@ function extension(path: string): string {
   return dot < 0 ? '' : name.slice(dot).toLowerCase();
 }
 
+export function supportedCandidateAssetMime(path: string): string | null {
+  const suffix = extension(path).slice(1);
+  return Object.hasOwn(SUPPORTED_CANDIDATE_ASSET_MIMES, suffix)
+    ? SUPPORTED_CANDIDATE_ASSET_MIMES[suffix as keyof typeof SUPPORTED_CANDIDATE_ASSET_MIMES]
+    : null;
+}
+
 function hasPathSuffix(path: string, suffix: string): boolean {
   return path === suffix || path.endsWith(`/${suffix}`);
 }
 
-function credentialBasenameTokens(name: string): { extension: string; tokens: string[] } {
-  const compatibilityName = name.normalize('NFKC');
-  const dot = compatibilityName.lastIndexOf('.');
-  const extension = dot > 0 ? compatibilityName.slice(dot + 1).toLowerCase() : '';
-  const stem = dot > 0 ? compatibilityName.slice(0, dot) : compatibilityName;
-  const canonical = stem
+function tokenizeCredentialBasename(name: string): string[] {
+  const canonical = name
     .replace(/([a-z0-9])([A-Z])/gu, '$1 $2')
     .replace(/([A-Z]+)([A-Z][a-z])/gu, '$1 $2')
     .toLowerCase();
-  return {
-    extension,
-    tokens: canonical.split(/[\p{P}\p{Z}\s]+/u).filter(Boolean),
-  };
+  return canonical
+    .split(/[\p{P}\p{Z}\s]+/u)
+    .filter(Boolean)
+    .flatMap((token) => CREDENTIAL_COMPOUNDS.get(token) ?? [token]);
 }
 
 function consumedBenignCredentialTokens(tokens: readonly string[]): Set<number> {
@@ -343,8 +429,30 @@ function consumedBenignCredentialTokens(tokens: readonly string[]): Set<number> 
 }
 
 function hasCredentialBasename(name: string): boolean {
-  const { extension, tokens } = credentialBasenameTokens(name);
-  if (CREDENTIAL_SOURCE_EXTENSIONS.has(extension) || tokens.length === 0) return false;
+  const compatibilityName = name.normalize('NFKC');
+  if (supportedCandidateAssetMime(compatibilityName) !== null) return false;
+  const dot = compatibilityName.lastIndexOf('.');
+  const finalExtension = dot > 0 ? compatibilityName.slice(dot + 1).toLowerCase() : '';
+  let classifiedName = compatibilityName;
+  if (CREDENTIAL_SOURCE_EXTENSIONS.has(finalExtension)) {
+    const preSourceName = compatibilityName.slice(0, dot);
+    const innerDot = preSourceName.lastIndexOf('.');
+    const innerExtension = innerDot > 0 ? preSourceName.slice(innerDot + 1).toLowerCase() : '';
+    if (!CREDENTIAL_INNER_RISK_EXTENSIONS.has(innerExtension)) return false;
+    classifiedName = preSourceName;
+  }
+  const tokens = tokenizeCredentialBasename(classifiedName);
+  if (tokens.length === 0) return false;
+  const classifiedDot = classifiedName.lastIndexOf('.');
+  const basenameTokens = tokenizeCredentialBasename(
+    classifiedDot > 0 ? classifiedName.slice(0, classifiedDot) : classifiedName,
+  );
+  if (
+    basenameTokens.length === 1 &&
+    CREDENTIAL_SINGLETON_TOKENS.has(basenameTokens[0] as string)
+  ) {
+    return true;
+  }
   if (tokens.length === 1 && CREDENTIAL_SINGLETON_TOKENS.has(tokens[0] as string)) {
     return true;
   }

@@ -280,6 +280,78 @@ describe('migration archive admission policy', () => {
     expect(() => assertArchiveEntries([entry(path)])).not.toThrow();
   });
 
+  it.each([
+    'config/credentials.json.ts',
+    'config/private-key.yaml.js',
+    'config/token.env.mjs',
+    'config/secret.toml.tsx',
+    'config/CLIENTSECRET.JSON.TS',
+  ])('rejects credential data filename %s hidden behind a source suffix', (path) => {
+    expect(() => assertArchiveEntries([entry(path)])).toThrow(/^bundle_entry_forbidden$/u);
+  });
+
+  it.each([
+    'src/auth-token.js',
+    'src/foo.schema.ts',
+    'src/button.stories.tsx',
+    'src/credential-form.test.ts',
+  ])('preserves ordinary reviewed source filename %s without a risky inner suffix', (path) => {
+    expect(() => assertArchiveEntries([entry(path)])).not.toThrow();
+  });
+
+  it.each([
+    'config/client.secret',
+    'config/api.token',
+    'config/private.credentials',
+    'config/access.tokens',
+    'config/design-token.secret',
+    'config/token-bucket.credentials',
+    'config/secret-santa.keys',
+  ])('classifies the complete non-source basename %s including its final segment', (path) => {
+    expect(() => assertArchiveEntries([entry(path)])).toThrow(/^bundle_entry_forbidden$/u);
+  });
+
+  it.each([
+    'config/APIKEY.json',
+    'config/APIKEYS.release',
+    'config/CLIENTSECRET.yaml',
+    'config/ACCESSTOKENS.production',
+    'config/SERVICEACCOUNT.toml',
+    'config/OAUTHSECRET-prod.conf',
+    'config/NPMTOKEN.stage',
+  ])('rejects exact uppercase credential compound %s without substring matching', (path) => {
+    expect(() => assertArchiveEntries([entry(path)])).toThrow(/^bundle_entry_forbidden$/u);
+  });
+
+  it.each([
+    'config/MONKEY.json',
+    'config/KEYBOARD.yaml',
+    'config/APIKEYBOARD.toml',
+  ])('admits uppercase near-neighbor %s that is not an exact credential compound', (path) => {
+    expect(() => assertArchiveEntries([entry(path)])).not.toThrow();
+  });
+
+  it.each([
+    'public/key.avif',
+    'public/token.gif',
+    'public/keys.jpg',
+    'public/client-secret.jpeg',
+    'public/key.png',
+    'public/api-key.svg',
+    'public/secret.webp',
+    'public/token.woff',
+    'public/private-key.woff2',
+  ])('defers supported candidate asset filename %s to structural validation', (path) => {
+    expect(() => assertArchiveEntries([entry(path)])).not.toThrow();
+  });
+
+  it.each([
+    'public/logo.ico',
+    'public/key.ico',
+  ])('keeps unsupported ICO candidate %s blocked', (path) => {
+    expect(() => assertArchiveEntries([entry(path)])).toThrow(/^bundle_entry_forbidden$/u);
+  });
+
   it('rejects generated provider state roots but admits similarly named source paths', () => {
     for (const path of [
       '.netlify/state.json',

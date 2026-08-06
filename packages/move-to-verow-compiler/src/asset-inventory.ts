@@ -177,6 +177,7 @@ const SHA256_PATTERN = /^sha256:[0-9a-f]{64}$/;
 const MIME_BY_FORMAT: Readonly<Record<string, string>> = {
   avif: 'image/avif',
   gif: 'image/gif',
+  heif: 'image/avif',
   jpeg: 'image/jpeg',
   png: 'image/png',
   svg: 'image/svg+xml',

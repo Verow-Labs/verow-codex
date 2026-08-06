@@ -3,6 +3,7 @@ import { PassThrough } from 'node:stream';
 import { brotliCompressSync, gunzipSync } from 'node:zlib';
 
 import { extract, pack, type Pack } from 'tar-stream';
+import sharp from 'sharp';
 import { describe, expect, it } from 'vitest';
 
 import { canonicalDigest, validateBundleDescriptor, validatePayloadIndex } from './bundle-contract.js';
@@ -56,6 +57,21 @@ function syntheticWoff2Bomb(): Buffer {
   bytes.writeUInt32BE(bytes.byteLength, 8);
   bytes.writeUInt16BE(1, 12);
   bytes.writeUInt32BE(10_000_004, 16);
+  bytes.writeUInt32BE(body.byteLength, 20);
+  bytes[48] = 5;
+  bytes[49] = 4;
+  body.copy(bytes, 50);
+  return bytes;
+}
+
+function syntheticWoff2(): Buffer {
+  const body = brotliCompressSync(Buffer.alloc(4));
+  const bytes = Buffer.alloc(50 + body.byteLength);
+  bytes.write('wOF2', 0, 'ascii');
+  bytes.writeUInt32BE(0x0001_0000, 4);
+  bytes.writeUInt32BE(bytes.byteLength, 8);
+  bytes.writeUInt16BE(1, 12);
+  bytes.writeUInt32BE(32, 16);
   bytes.writeUInt32BE(body.byteLength, 20);
   bytes[48] = 5;
   bytes[49] = 4;
@@ -989,6 +1005,81 @@ describe('deterministic migration bundle', () => {
     }];
     relinkArtifactDigests(missing.artifacts);
     await expect(createMigrationBundle(missing)).resolves.toBeDefined();
+  });
+
+  it.each([
+    'public/logo.avif',
+    'public/logo.gif',
+    'public/logo.jpg',
+    'public/logo.jpeg',
+    'public/logo.png',
+    'public/logo.svg',
+    'public/logo.webp',
+    'public/logo.woff',
+    'public/logo.woff2',
+  ])('requires text-looking supported asset path %s to have structural closure', async (path) => {
+    const candidate = [
+      ...baseCandidate,
+      { path, bytes: encoder.encode('synthetic source text'), executable: false },
+    ];
+    await expect(
+      createMigrationBundle(input({ candidate, artifacts: artifacts(candidate).compiled })),
+    ).rejects.toThrow(/^bundle_contract_invalid$/u);
+  });
+
+  it('rejects a supported asset suffix whose inspected MIME is spoofed by its declaration', async () => {
+    const jpegBytes = new Uint8Array(await sharp({
+      create: { width: 1, height: 1, channels: 4, background: { r: 1, g: 2, b: 3, alpha: 1 } },
+    }).jpeg().toBuffer());
+    const path = 'public/logo.png';
+    const candidate = [...baseCandidate, { path, bytes: jpegBytes, executable: false }];
+    const spoofed = input({ candidate, artifacts: artifacts(candidate).compiled });
+    spoofed.artifacts.privateManifest.structuralAssets = [{
+      digest: sha256(jpegBytes),
+      mime: 'image/jpeg',
+      references: [{ id: 'spoofed-logo', sourcePath: path }],
+    }];
+    relinkArtifactDigests(spoofed.artifacts);
+    await expect(createMigrationBundle(spoofed)).rejects.toThrow(/^bundle_contract_invalid$/u);
+  });
+
+  it('admits sensitive supported asset names only with exact Task 4 structural closure', async () => {
+    const pixel = {
+      create: { width: 1, height: 1, channels: 4 as const, background: { r: 1, g: 2, b: 3, alpha: 1 } },
+    };
+    const cases = [
+      ['public/key.avif', await sharp(pixel).avif().toBuffer(), 'image/avif'],
+      ['public/token.gif', await sharp(pixel).gif().toBuffer(), 'image/gif'],
+      ['public/keys.jpg', await sharp(pixel).jpeg().toBuffer(), 'image/jpeg'],
+      ['public/client-secret.jpeg', await sharp(pixel).jpeg().toBuffer(), 'image/jpeg'],
+      ['public/key.png', validPng2x2, 'image/png'],
+      ['public/api-key.svg', encoder.encode('<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"><rect width="1" height="1"/></svg>'), 'image/svg+xml'],
+      ['public/secret.webp', await sharp(pixel).webp().toBuffer(), 'image/webp'],
+      ['public/token.woff', syntheticWoff(), 'font/woff'],
+      ['public/private-key.woff2', syntheticWoff2(), 'font/woff2'],
+    ] as const;
+    for (const [path, bytesValue, mime] of cases) {
+      const bytes = new Uint8Array(bytesValue);
+      const candidate = [...baseCandidate, { path, bytes, executable: false }];
+      const valid = input({ candidate, artifacts: artifacts(candidate).compiled });
+      valid.artifacts.privateManifest.structuralAssets = [{
+        digest: sha256(bytes),
+        mime,
+        references: [{ id: 'supported-asset', sourcePath: path }],
+      }];
+      relinkArtifactDigests(valid.artifacts);
+      await expect(createMigrationBundle(valid)).resolves.toBeDefined();
+    }
+  });
+
+  it('keeps unsupported ICO candidates blocked end to end', async () => {
+    const candidate = [
+      ...baseCandidate,
+      { path: 'public/logo.ico', bytes: encoder.encode('synthetic source text'), executable: false },
+    ];
+    await expect(
+      createMigrationBundle(input({ candidate, artifacts: artifacts(candidate).compiled })),
+    ).rejects.toThrow(/^bundle_entry_forbidden$/u);
   });
 
   it('requires exact structural closure for a renamed whole-document SVG', async () => {

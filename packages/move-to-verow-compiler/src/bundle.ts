@@ -11,6 +11,7 @@ import {
   copyArchiveEntries,
   isSafeByteArray,
   resolveArchiveLimits,
+  supportedCandidateAssetMime,
   type ArchiveLimits,
   type BundleEntryInput,
 } from './archive-policy.js';
@@ -1302,7 +1303,13 @@ async function assertArtifactContracts(
     if (inspected === null || inspected.mime !== asset.mime) fail('bundle_contract_invalid');
   }
   for (const entry of candidate) {
-    if (structuralMimeByPath.has(entry.path)) continue;
+    const structuralMime = structuralMimeByPath.get(entry.path);
+    const supportedAssetMime = supportedCandidateAssetMime(entry.path);
+    if (supportedAssetMime !== null) {
+      if (structuralMime !== supportedAssetMime) fail('bundle_contract_invalid');
+      continue;
+    }
+    if (structuralMime !== undefined) continue;
     if (hasMigrationSvgDocumentStart(entry.bytes)) {
       const inspected = await inspectMigrationAssetBytes(entry.bytes);
       if (inspected === null || inspected.mime !== 'image/svg+xml') {
