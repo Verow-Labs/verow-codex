@@ -5,7 +5,10 @@ export {
   type WorkspaceEntry,
   type WorkspaceReader,
 } from './admission.js';
-export { type ContentCandidate, type ContentSourceKind } from './inventory.js';
+export {
+  type ContentCandidate as InventoriedContentCandidate,
+  type ContentSourceKind,
+} from './inventory.js';
 export {
   bundleContractProvenance,
   canonicalDigest,
@@ -22,3 +25,35 @@ export {
   type NativeNextCandidate,
   type NativeNextMutation,
 } from './native-next-transform.js';
+export {
+  compileCollectionContentKey,
+  compileContentKey,
+  contentKeyConfusablesProvenance,
+  contentValueIdentity,
+  normalizeSemanticSegment,
+  semanticConfusableSkeleton,
+  type CompileContentKeyInput,
+  type CompileCollectionContentKeyInput,
+  type ContentKeyScope,
+} from './content-key.js';
+export {
+  extractManagedContent,
+  type AuthorizedContentSource,
+  type ContentCandidate,
+  type ContentExtractionBlocker,
+  type ContentExtractionBlockerCode,
+  type ContentExtractionInput,
+  type ContentExtractionLimits,
+  type ContentExtractionResult,
+  type ContentLocaleVariant,
+  type ContentOwner,
+  type ContentRouteIdentity,
+  type DerivedContentCandidate,
+  type DetectedContentIntegration,
+  type ManagedContentSourceKind,
+  type ManagedContentValue,
+  type ManagedContentValueType,
+  type StructuralContentCandidate,
+  type StructuredFamily,
+  type ThirdPartyBoundary,
+} from './content-extractor.js';

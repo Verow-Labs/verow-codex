@@ -1,0 +1,9 @@
+{
+  "organization": {
+    "id": "synthetic-organization",
+    "name": "Synthetic organization name",
+    "description": "Synthetic JSON-LD wording",
+    "@type": "Organization"
+  },
+  "announcement": "Synthetic JSON announcement"
+}

@@ -1,0 +1,11 @@
+.testimonial::before {
+  content: "Synthetic generated quote marker";
+}
+
+:root {
+  --brand-accent: #123456;
+}
+
+.decoration {
+  background-image: url('/synthetic-texture.svg');
+}
