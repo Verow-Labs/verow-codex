@@ -201,6 +201,8 @@ const CREDENTIAL_TOKEN_PAIRS = new Set([
 const CREDENTIAL_CONNECTION_COORDINATE_PAIRS = new Set([
   'connection:string',
   'connection:uri',
+  'connection:url',
+  'database:string',
   'database:uri',
   'database:url',
 ]);
@@ -316,7 +318,13 @@ const SUPPORTED_CANDIDATE_ASSET_MIMES = Object.freeze({
   woff2: 'font/woff2',
 } as const);
 const UNSUPPORTED_CANDIDATE_ASSET_SUFFIXES = new Set([
+  '3g2',
+  '3gp',
+  'aac',
+  'aif',
+  'aiff',
   'apng',
+  'avi',
   'bmp',
   'eot',
   'flac',
@@ -326,18 +334,28 @@ const UNSUPPORTED_CANDIDATE_ASSET_SUFFIXES = new Set([
   'jpe',
   'jfif',
   'jxl',
+  'm4a',
   'm4v',
+  'mkv',
   'mov',
   'mp3',
   'mp4',
+  'mpeg',
+  'mpg',
+  'oga',
   'ogg',
+  'ogv',
+  'opus',
   'otf',
   'svgz',
   'tif',
   'tiff',
+  'ttc',
   'ttf',
   'wav',
   'webm',
+  'wma',
+  'wmv',
 ]);
 const PDF_PREFIX_WHITESPACE = new Set([0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x20]);
 interface BlockedFormat {

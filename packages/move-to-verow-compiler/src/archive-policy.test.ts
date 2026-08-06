@@ -439,12 +439,18 @@ describe('migration archive admission policy', () => {
   it.each([
     'config/CONNECTIONSTRING',
     'config/connection-string',
+    'config/CONNECTIONURL',
+    'config/connection-url',
     'config/DATABASEURL',
     'config/database-url',
+    'config/DATABASESTRING',
+    'config/database-string',
     'config/CONNECTIONURI',
     'config/connection_uri',
     'config/DATABASEURI',
     'config/database.uri',
+    'config/ＣＯＮＮＥＣＴＩＯＮＵＲＬ',
+    'config/ＤＡＴＡＢＡＳＥＳＴＲＩＮＧ',
   ])('rejects exact connection-coordinate compound %s', (path) => {
     expect(() => assertArchiveEntries([entry(path)])).toThrow(/^bundle_entry_forbidden$/u);
   });
@@ -455,6 +461,9 @@ describe('migration archive admission policy', () => {
     'config/STRING',
     'config/CONNECTIONSTRINGIFY',
     'config/DATABASEURLBUILDER',
+    'config/URLCONNECTION',
+    'config/STRINGDATABASE',
+    'config/URICONNECTIONAL',
   ])('does not treat bare connection-coordinate word or near-neighbor %s as a secret', (path) => {
     expect(() => assertArchiveEntries([entry(path)])).not.toThrow();
   });
@@ -607,8 +616,27 @@ describe('migration archive admission policy', () => {
     'public/audio.wav',
     'public/audio.ogg',
     'public/audio.flac',
+    'public/audio.aac',
+    'public/audio.aif',
+    'public/audio.aiff',
+    'public/audio.m4a',
+    'public/audio.oga',
+    'public/audio.opus',
+    'public/audio.wma',
+    'public/video.3g2',
+    'public/video.3gp',
+    'public/video.avi',
+    'public/video.mkv',
+    'public/video.mpeg',
+    'public/video.mpg',
+    'public/video.ogv',
+    'public/video.wmv',
+    'public/font.ttc',
     'public/photo．ＨＥＩＣ',
     'public/video.ＭＰ４',
+    'public/audio.ＡＡＣ',
+    'public/video．ＭＫＶ',
+    'public/font.ＴＴＣ',
   ])('rejects text-looking unsupported candidate asset suffix %s', (path) => {
     expect(() => assertArchiveEntries([entry(path)])).toThrow(/^bundle_entry_forbidden$/u);
   });
@@ -630,10 +658,26 @@ describe('migration archive admission policy', () => {
     ['public/audio.wav', [0x52, 0x49, 0x46, 0x46, 0x00, 0x00, 0x00, 0x00, 0x57, 0x41, 0x56, 0x45]],
     ['public/audio.ogg', [0x4f, 0x67, 0x67, 0x53]],
     ['public/audio.flac', [0x66, 0x4c, 0x61, 0x43]],
+    ['public/audio.aac', [0xff, 0xf1, 0x50, 0x80]],
+    ['public/audio.aiff', [0x46, 0x4f, 0x52, 0x4d, 0x00, 0x00, 0x00, 0x00, 0x41, 0x49, 0x46, 0x46]],
+    ['public/audio.m4a', [0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70, 0x4d, 0x34, 0x41, 0x20]],
+    ['public/audio.opus', [0x4f, 0x67, 0x67, 0x53, 0x00, 0x02, 0x4f, 0x70, 0x75, 0x73]],
+    ['public/audio.wma', [0x30, 0x26, 0xb2, 0x75, 0x8e, 0x66, 0xcf, 0x11]],
+    ['public/video.3gp', [0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70, 0x33, 0x67, 0x70, 0x35]],
+    ['public/video.avi', [0x52, 0x49, 0x46, 0x46, 0x00, 0x00, 0x00, 0x00, 0x41, 0x56, 0x49, 0x20]],
+    ['public/video.mkv', [0x1a, 0x45, 0xdf, 0xa3]],
+    ['public/video.mpeg', [0x00, 0x00, 0x01, 0xba]],
+    ['public/video.ogv', [0x4f, 0x67, 0x67, 0x53]],
+    ['public/video.wmv', [0x30, 0x26, 0xb2, 0x75, 0x8e, 0x66, 0xcf, 0x11]],
+    ['public/font.ttc', [0x74, 0x74, 0x63, 0x66, 0x00, 0x01, 0x00, 0x00]],
   ])('rejects representative real unsupported binary payload at %s', (path, payload) => {
     expect(() =>
       assertArchiveEntries([entry(path, { bytes: new Uint8Array(payload) })]),
     ).toThrow(/^bundle_entry_forbidden$/u);
+  });
+
+  it('keeps the reviewed .ts suffix available for TypeScript source', () => {
+    expect(() => assertArchiveEntries([entry('src/media.ts')])).not.toThrow();
   });
 
   it('rejects generated provider state roots but admits similarly named source paths', () => {
