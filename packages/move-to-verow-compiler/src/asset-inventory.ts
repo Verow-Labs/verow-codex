@@ -344,7 +344,7 @@ function exactObjectKeys(value: object, keys: readonly string[]): boolean {
   return actual.length === keys.length && actual.every((key, index) => key === [...keys].sort()[index]);
 }
 
-function validCaptureReceipt(receipt: unknown, bytes: Uint8Array, digest: AssetDigest, mime: string, limits: AssetInventoryLimits): receipt is CaptureReceiptV1 {
+function validCaptureReceiptPreflight(receipt: unknown, limits: AssetInventoryLimits): receipt is CaptureReceiptV1 {
   if (!isRecord(receipt) || !exactObjectKeys(receipt, [
     'authorizationStripped', 'byteCount', 'byteLimit', 'cookiesStripped', 'digest', 'finalUrl', 'originalUrl',
     'policyVersion', 'redirects', 'resolvedAddresses', 'sniffedMime',
@@ -352,7 +352,7 @@ function validCaptureReceipt(receipt: unknown, bytes: Uint8Array, digest: AssetD
   const candidate = receipt as Record<string, unknown>;
   if (candidate.policyVersion !== 'move-to-verow.capture-receipt.v1' || candidate.cookiesStripped !== true || candidate.authorizationStripped !== true) return false;
   if (!Number.isSafeInteger(candidate.byteLimit) || !Number.isSafeInteger(candidate.byteCount) || (candidate.byteLimit as number) <= 0 || (candidate.byteLimit as number) > limits.maxSingleBytes) return false;
-  if (candidate.byteCount !== bytes.byteLength || (candidate.byteLimit as number) < bytes.byteLength || candidate.digest !== digest || candidate.sniffedMime !== mime) return false;
+  if ((candidate.byteCount as number) <= 0 || (candidate.byteCount as number) > (candidate.byteLimit as number) || typeof candidate.digest !== 'string' || !SHA256_PATTERN.test(candidate.digest) || typeof candidate.sniffedMime !== 'string' || !safeToken(candidate.sniffedMime)) return false;
   const redirectCount = plainArrayLength(candidate.redirects);
   if (redirectCount === null || redirectCount > 32 || !isPlainArray(candidate.redirects) || !candidate.redirects.every((url) => typeof url === 'string')) return false;
   const urls = [candidate.originalUrl, ...candidate.redirects, candidate.finalUrl];
@@ -370,6 +370,10 @@ function validCaptureReceipt(receipt: unknown, bytes: Uint8Array, digest: AssetD
     return resolved.public === true && typeof resolved.host === 'string' && hosts.includes(resolved.host) && typeof resolved.address === 'string' && isPublicIpAddress(resolved.address);
   })) return false;
   return [...new Set(hosts)].every((host) => receipts.some((entry) => (entry as { host?: unknown }).host === host));
+}
+
+function validCaptureReceiptLinkage(receipt: CaptureReceiptV1, bytes: Uint8Array, digest: AssetDigest, mime: string): boolean {
+  return receipt.byteCount === bytes.byteLength && receipt.byteLimit >= bytes.byteLength && receipt.digest === digest && receipt.sniffedMime === mime;
 }
 
 function looksLikeSvg(bytes: Uint8Array): boolean {
@@ -597,6 +601,8 @@ function inspectWoff2(buffer: Buffer, limits: AssetInventoryLimits): boolean {
   let cursor = 48;
   let decompressedSize = 0;
   let expectedSfntSize = 12 + count * 16;
+  let glyf: { index: number; storedLength: number; transformed: boolean } | undefined;
+  let loca: { index: number; storedLength: number; transformed: boolean } | undefined;
   for (let index = 0; index < count; index += 1) {
     const flags = buffer[cursor];
     if (flags === undefined) return false;
@@ -619,8 +625,8 @@ function inspectWoff2(buffer: Buffer, limits: AssetInventoryLimits): boolean {
     expectedSfntSize += align4(original.value);
     if (!Number.isSafeInteger(expectedSfntSize) || expectedSfntSize > limits.maxFontBytes) return false;
     const transformVersion = flags >>> 6;
-    const transformed = tag === 'glyf' || tag === 'loca' ? transformVersion === 0 : tag === 'hmtx' && transformVersion === 1;
-    if ((tag === 'glyf' || tag === 'loca') ? transformVersion === 1 || transformVersion === 2 : tag === 'hmtx' ? transformVersion > 1 : transformVersion !== 0) return false;
+    const transformed = (tag === 'glyf' || tag === 'loca') && transformVersion === 0;
+    if ((tag === 'glyf' || tag === 'loca') ? transformVersion === 1 || transformVersion === 2 : transformVersion !== 0) return false;
     let storedLength = original.value;
     if (transformed) {
       const transform = readUIntBase128(buffer, cursor);
@@ -628,9 +634,13 @@ function inspectWoff2(buffer: Buffer, limits: AssetInventoryLimits): boolean {
       cursor = transform.next;
       storedLength = transform.value;
     }
+    if (tag === 'glyf') glyf = { index, storedLength, transformed };
+    if (tag === 'loca') loca = { index, storedLength, transformed };
     decompressedSize += storedLength;
     if (!Number.isSafeInteger(decompressedSize) || decompressedSize > limits.maxFontBytes) return false;
   }
+  if ((glyf === undefined) !== (loca === undefined)) return false;
+  if (glyf !== undefined && loca !== undefined && (glyf.index >= loca.index || glyf.transformed !== loca.transformed || (loca.transformed && loca.storedLength !== 0))) return false;
   if (expectedSfntSize !== totalSfntSize) return false;
   if (cursor > buffer.length - totalCompressedSize) return false;
   try {
@@ -723,6 +733,9 @@ export async function inventoryMigrationAssets(input: AssetInventoryInput): Prom
   if (assetCount === null) return contentFreeResult('asset_input_invalid');
   if (assetCount > limits.maxAssets || assetCount > limits.maxReferences) return contentFreeResult('asset_policy_blocked');
   if (!isPlainArray(input.assets) || input.assets.some((asset) => !validAssetInput(asset))) return contentFreeResult('asset_input_invalid');
+  for (const asset of input.assets) {
+    if (asset.authority === 'hosted_source_capture' && !validCaptureReceiptPreflight(asset.captureReceipt, limits)) return contentFreeResult('capture_receipt_invalid');
+  }
   let attemptedBytes = 0;
   for (const asset of input.assets) {
     if (asset.authority === 'declared_external') continue;
@@ -817,7 +830,7 @@ export async function inventoryMigrationAssets(input: AssetInventoryInput): Prom
       inspected = await inspectImage(asset.bytes, limits);
     }
     if (fontCount > limits.maxFonts || inspected === null) { block('asset_policy_blocked'); continue; }
-    if (asset.authority === 'hosted_source_capture' && !validCaptureReceipt(asset.captureReceipt, asset.bytes, actualDigest, inspected.mime, limits)) {
+    if (asset.authority === 'hosted_source_capture' && !validCaptureReceiptLinkage(asset.captureReceipt, asset.bytes, actualDigest, inspected.mime)) {
       block('capture_receipt_invalid');
       continue;
     }

@@ -124,6 +124,24 @@ describe('migration asset inventory', () => {
     }
   });
 
+  it('rejects malformed hosted receipts before any byte, hash, magic, or decoder inspection', async () => {
+    class ObservedBytes extends Uint8Array {
+      reads = 0;
+      override get byteLength(): number { this.reads += 1; return super.byteLength; }
+    }
+    const bytes = new ObservedBytes(Buffer.from('invalid image bytes'));
+    const digest = sha256(bytes);
+    bytes.reads = 0;
+    const redirects = Array.from({ length: 33 }, () => 'https://assets.example.test/redirect.png');
+    const result = await inventoryMigrationAssets({ assets: [{
+      ...local({ authority: 'hosted_source_capture', bytes, digest } as never),
+      captureReceipt: captureReceipt({ redirects, byteCount: bytes.length, digest }),
+    } as AssetInput] });
+
+    expect(result.blockers).toEqual([{ code: 'capture_receipt_invalid' }]);
+    expect(bytes.reads).toBe(0);
+  });
+
   it('rejects IANA special-use IPv6 evidence while accepting clearly global unicast addresses', async () => {
     const captured = local({ authority: 'hosted_source_capture' } as never);
     const specialUse = [
@@ -316,6 +334,36 @@ describe('migration asset inventory', () => {
     const overflowingBase128 = syntheticWoff2({ count: 1, directory: Buffer.from([5, 0x90, 0x80, 0x80, 0x80, 0]), decompressed: Buffer.alloc(1), totalSfntSize: 32 });
     const overflowingSfntSize = syntheticWoff2({ count: 1, directory: Buffer.from([0x43, 0x8f, 0xff, 0xff, 0xff, 0x7f, 1]), decompressed: Buffer.alloc(1), totalSfntSize: 28 });
     for (const [id, bytes] of Object.entries({ mismatchedSize, collection, reservedTransform, leadingZeroBase128, overflowingBase128, overflowingSfntSize })) {
+      const result = await inventoryMigrationAssets({ assets: [asFont(bytes, id)] });
+      expect(result.blockers, id).toEqual([{ code: 'asset_policy_blocked' }]);
+    }
+  });
+
+  it('requires ordered glyf-loca pairs with matching transform and length semantics', async () => {
+    const asFont = (bytes: Uint8Array, id: string): AssetInput => local({
+      classification: 'structural_git', bytes, digest: sha256(bytes),
+      reference: { id, sourcePath: `fonts/${id}.woff2` }, structuralKind: 'font',
+      fontLicense: { spdxId: 'OFL-1.1', notice: 'Synthetic WOFF2 pair fixture' },
+    } as never);
+    const validTransformed = syntheticWoff2({ count: 2, directory: Buffer.from([10, 4, 4, 11, 4, 0]), decompressed: Buffer.alloc(4), totalSfntSize: 52 });
+    const validInterleaved = syntheticWoff2({ count: 3, directory: Buffer.from([10, 4, 4, 5, 4, 11, 4, 0]), decompressed: Buffer.alloc(8), totalSfntSize: 72 });
+    const validUntransformed = syntheticWoff2({ count: 2, directory: Buffer.from([0xca, 4, 0xcb, 4]), decompressed: Buffer.alloc(8), totalSfntSize: 52 });
+    for (const [id, bytes] of Object.entries({ validTransformed, validInterleaved, validUntransformed })) {
+      const result = await inventoryMigrationAssets({ assets: [asFont(bytes, id)] });
+      expect(result.status, id).toBe('ready');
+    }
+
+    const invalid = {
+      missingLoca: syntheticWoff2({ count: 1, directory: Buffer.from([10, 4, 4]), decompressed: Buffer.alloc(4), totalSfntSize: 32 }),
+      missingGlyf: syntheticWoff2({ count: 1, directory: Buffer.from([11, 4, 0]), decompressed: Buffer.alloc(0), totalSfntSize: 32 }),
+      transformedGlyfRawLoca: syntheticWoff2({ count: 2, directory: Buffer.from([10, 4, 4, 0xcb, 4]), decompressed: Buffer.alloc(8), totalSfntSize: 52 }),
+      rawGlyfTransformedLoca: syntheticWoff2({ count: 2, directory: Buffer.from([0xca, 4, 11, 4, 0]), decompressed: Buffer.alloc(4), totalSfntSize: 52 }),
+      locaBeforeGlyf: syntheticWoff2({ count: 2, directory: Buffer.from([11, 4, 0, 10, 4, 4]), decompressed: Buffer.alloc(4), totalSfntSize: 52 }),
+      nonzeroLocaTransform: syntheticWoff2({ count: 2, directory: Buffer.from([10, 4, 4, 11, 4, 1]), decompressed: Buffer.alloc(5), totalSfntSize: 52 }),
+      duplicateGlyf: syntheticWoff2({ count: 3, directory: Buffer.from([10, 4, 4, 10, 4, 4, 11, 4, 0]), decompressed: Buffer.alloc(8), totalSfntSize: 72 }),
+      unprovenHmtxTransform: syntheticWoff2({ count: 1, directory: Buffer.from([0x43, 4, 4]), decompressed: Buffer.alloc(4), totalSfntSize: 32 }),
+    };
+    for (const [id, bytes] of Object.entries(invalid)) {
       const result = await inventoryMigrationAssets({ assets: [asFont(bytes, id)] });
       expect(result.blockers, id).toEqual([{ code: 'asset_policy_blocked' }]);
     }
