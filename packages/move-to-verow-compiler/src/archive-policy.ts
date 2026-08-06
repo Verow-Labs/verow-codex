@@ -109,6 +109,7 @@ const CREDENTIAL_SINGLETON_TOKENS = new Set([
   'auth',
   'credential',
   'credentials',
+  'key',
   'secret',
   'secrets',
   'token',
@@ -163,7 +164,9 @@ const CREDENTIAL_PROVIDER_TOKENS = new Set([
   'gitlab',
   'google',
   'netlify',
+  'npm',
   'openai',
+  'sanity',
   'sendgrid',
   'stripe',
   'supabase',
@@ -178,7 +181,20 @@ const CREDENTIAL_SENSITIVE_TOKENS = new Set([
   'token',
   'tokens',
 ]);
-const CREDENTIAL_AUTH_CONTEXT_TOKENS = new Set(['auth', 'refresh']);
+const CREDENTIAL_CONTEXT_TOKENS = new Set([
+  'access',
+  'api',
+  'auth',
+  'authentication',
+  'authorization',
+  'bearer',
+  'client',
+  'oauth',
+  'private',
+  'refresh',
+  'service',
+  'session',
+]);
 const PDF_PREFIX_WHITESPACE = new Set([0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x20]);
 interface BlockedFormat {
   extensions: readonly string[];
@@ -328,8 +344,24 @@ function credentialBasenameTokens(name: string): { extension: string; tokens: st
     .toLowerCase();
   return {
     extension,
-    tokens: canonical.split(/[._\-\s]+/u).filter(Boolean),
+    tokens: canonical.split(/[\p{P}\p{Z}\s]+/u).filter(Boolean),
   };
+}
+
+function consumedBenignCredentialTokens(tokens: readonly string[]): Set<number> {
+  const consumed = new Set<number>();
+  for (let index = 0; index + 1 < tokens.length; index += 1) {
+    const current = tokens[index];
+    const next = tokens[index + 1];
+    if (current === 'design' && (next === 'token' || next === 'tokens')) {
+      consumed.add(index + 1);
+    } else if (current === 'token' && (next === 'bucket' || next === 'count')) {
+      consumed.add(index);
+    } else if (current === 'secret' && next === 'santa') {
+      consumed.add(index);
+    }
+  }
+  return consumed;
 }
 
 function hasCredentialBasename(name: string): boolean {
@@ -338,17 +370,27 @@ function hasCredentialBasename(name: string): boolean {
   if (tokens.length === 1 && CREDENTIAL_SINGLETON_TOKENS.has(tokens[0] as string)) {
     return true;
   }
-  const hasSensitiveToken = tokens.some((token) => CREDENTIAL_SENSITIVE_TOKENS.has(token));
+  const consumed = consumedBenignCredentialTokens(tokens);
+  const hasUnconsumedSensitiveToken = tokens.some(
+    (token, index) => CREDENTIAL_SENSITIVE_TOKENS.has(token) && !consumed.has(index),
+  );
   if (
-    hasSensitiveToken &&
+    hasUnconsumedSensitiveToken &&
     (tokens.some((token) => CREDENTIAL_PROVIDER_TOKENS.has(token)) ||
-      tokens.some((token) => CREDENTIAL_AUTH_CONTEXT_TOKENS.has(token)))
+      tokens.some((token) => CREDENTIAL_CONTEXT_TOKENS.has(token)))
   ) {
     return true;
   }
   for (let index = 0; index + 1 < tokens.length; index += 1) {
     const pair = `${tokens[index]}:${tokens[index + 1]}`;
-    if (CREDENTIAL_TOKEN_PAIRS.has(pair)) return true;
+    if (
+      CREDENTIAL_TOKEN_PAIRS.has(pair) &&
+      (pair === 'service:account' ||
+        (CREDENTIAL_SENSITIVE_TOKENS.has(tokens[index] as string) && !consumed.has(index)) ||
+        (CREDENTIAL_SENSITIVE_TOKENS.has(tokens[index + 1] as string) && !consumed.has(index + 1)))
+    ) {
+      return true;
+    }
   }
   return false;
 }

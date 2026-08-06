@@ -176,6 +176,57 @@ describe('migration archive admission policy', () => {
     ).not.toThrow();
   });
 
+  it.each([
+    'config/api-production-secret.json',
+    'config/credentials-release-access.yaml',
+    'config/client-live-key.yml',
+    'config/private-production-token.toml',
+    'config/service-beta-secrets.env',
+    'config/sanity-release-token.ini',
+    'config/token-production-npm.txt',
+    'config/oauth-live-credential.db',
+    'config/key-production-bearer',
+    'config/session-beta-credentials.json',
+    'config/token-production-authentication.yaml',
+    'config/authorization-prod-secret.toml',
+    'config/key.json',
+    'config/key',
+    'config/github／production／token.json',
+    'config/production：openai：secret.yaml',
+    'config/supabase·production·token.toml',
+  ])('rejects semantic credential basename %s across qualifiers and Unicode separators', (path) => {
+    expect(() => assertArchiveEntries([entry(path)])).toThrow(/^bundle_entry_forbidden$/u);
+  });
+
+  it.each([
+    'config/github-token-count.json',
+    'config/auth-token-bucket.yaml',
+    'config/refresh-production-token-count.toml',
+    'config/openai-production-token-bucket.env',
+    'config/stripe-secret-santa.ini',
+    'config/github-production-secret-santa',
+    'config/sanity-design-token.txt',
+    'config/npm-design-tokens.db',
+    'config/authentication-token-count.yml',
+    'config/github-token.js',
+    'config/oauth-secret.ts',
+    'config/session-key.css',
+  ])('admits complete benign credential-like unit %s without weakening extension policy', (path) => {
+    expect(() => assertArchiveEntries([entry(path)])).not.toThrow();
+  });
+
+  it.each([
+    'config/github-token-count-secret.json',
+    'config/refresh-token-bucket-key.yaml',
+    'config/openai-secret-santa-token.toml',
+    'config/authentication-design-token-credentials.env',
+    'config/secret-santa-production-npm-key.ini',
+    'config/design-tokens-oauth-secret.txt',
+    'config/sanity-token-count-bearer-secret',
+  ])('rejects unconsumed credential token in combined benign and sensitive basename %s', (path) => {
+    expect(() => assertArchiveEntries([entry(path)])).toThrow(/^bundle_entry_forbidden$/u);
+  });
+
   it('rejects generated provider state roots but admits similarly named source paths', () => {
     for (const path of [
       '.netlify/state.json',
