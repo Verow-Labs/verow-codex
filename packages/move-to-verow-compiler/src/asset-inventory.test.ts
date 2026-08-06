@@ -109,6 +109,9 @@ describe('migration asset inventory', () => {
     for (const source of [
       '<s:svg xmlns:s="http://www.w3.org/2000/svg" width="1" height="1"><s:rect width="1" height="1"/></s:svg>',
       '<vector:svg xmlns:vector="http://www.w3.org/2000/svg" width="1" height="1"><vector:path d="M0 0"/></vector:svg>',
+      '<é:svg xmlns:é="http://www.w3.org/2000/svg" width="1" height="1"><é:rect width="1" height="1"/></é:svg>',
+      '<图:svg xmlns:图="http://www.w3.org/2000/svg" width="1" height="1"><图:path d="M0 0"/></图:svg>',
+      '<s.x:svg xmlns:s.x="http://www.w3.org/2000/svg" width="1" height="1"><s.x:circle cx="1" cy="1" r="1"/></s.x:svg>',
     ]) {
       await expect(inspectMigrationAssetBytes(Buffer.from(source))).resolves.toMatchObject({
         mime: 'image/svg+xml',
@@ -121,6 +124,12 @@ describe('migration asset inventory', () => {
       '<s:svg xmlns:s="https://example.test/not-svg"><s:path d="M0 0"/></s:svg>',
       '<s:svg><s:path d="M0 0"/></s:svg>',
       '<s:svg xmlns:s="http://www.w3.org/2000/svg"><other:path d="M0 0"/></s:svg>',
+      '<é:svg xmlns:é="http://www.w3.org/2000/svg"><é:script>alert(1)</é:script></é:svg>',
+      '<图:svg xmlns:图="http://www.w3.org/2000/svg"><图:use href="https://example.test/x.svg#x"/></图:svg>',
+      '<xml:svg xmlns:xml="http://www.w3.org/2000/svg"><xml:path d="M0 0"/></xml:svg>',
+      '<xmlns:svg xmlns:xmlns="http://www.w3.org/2000/svg"><xmlns:path d="M0 0"/></xmlns:svg>',
+      '<s:x:svg xmlns:s="http://www.w3.org/2000/svg"><s:path d="M0 0"/></s:x:svg>',
+      '<1s:svg xmlns:1s="http://www.w3.org/2000/svg"><1s:path d="M0 0"/></1s:svg>',
     ]) {
       await expect(inspectMigrationAssetBytes(Buffer.from(source))).resolves.toBeNull();
     }

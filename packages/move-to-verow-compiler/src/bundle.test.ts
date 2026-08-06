@@ -1010,21 +1010,28 @@ describe('deterministic migration bundle', () => {
   });
 
   it('requires exact structural closure for namespace-prefixed whole-document SVG roots', async () => {
-    const svgBytes = encoder.encode(
-      '<s:svg xmlns:s="http://www.w3.org/2000/svg" width="1" height="1"><s:rect width="1" height="1"/></s:svg>',
-    );
-    const structuralPath = 'public/prefixed-vector.data';
-    const candidate = [...baseCandidate, { path: structuralPath, bytes: svgBytes, executable: false }];
-    const missing = input({ candidate, artifacts: artifacts(candidate).compiled });
-    await expect(createMigrationBundle(missing)).rejects.toThrow(/^bundle_contract_invalid$/u);
+    for (const [name, prefix] of [
+      ['ascii', 's'],
+      ['unicode-latin', 'é'],
+      ['unicode-cjk', '图'],
+      ['dotted', 's.x'],
+    ] as const) {
+      const svgBytes = encoder.encode(
+        `<${prefix}:svg xmlns:${prefix}="http://www.w3.org/2000/svg" width="1" height="1"><${prefix}:rect width="1" height="1"/></${prefix}:svg>`,
+      );
+      const structuralPath = `public/prefixed-vector-${name}.data`;
+      const candidate = [...baseCandidate, { path: structuralPath, bytes: svgBytes, executable: false }];
+      const missing = input({ candidate, artifacts: artifacts(candidate).compiled });
+      await expect(createMigrationBundle(missing)).rejects.toThrow(/^bundle_contract_invalid$/u);
 
-    missing.artifacts.privateManifest.structuralAssets = [{
-      digest: sha256(svgBytes),
-      mime: 'image/svg+xml',
-      references: [{ id: 'prefixed-vector', sourcePath: structuralPath }],
-    }];
-    relinkArtifactDigests(missing.artifacts);
-    await expect(createMigrationBundle(missing)).resolves.toBeDefined();
+      missing.artifacts.privateManifest.structuralAssets = [{
+        digest: sha256(svgBytes),
+        mime: 'image/svg+xml',
+        references: [{ id: `prefixed-vector-${name}`, sourcePath: structuralPath }],
+      }];
+      relinkArtifactDigests(missing.artifacts);
+      await expect(createMigrationBundle(missing)).resolves.toBeDefined();
+    }
   });
 
   it('blocks unsafe and namespace-invalid prefixed SVG roots outside structural closure', async () => {
@@ -1033,6 +1040,13 @@ describe('deterministic migration bundle', () => {
       ['external', '<s:svg xmlns:s="http://www.w3.org/2000/svg"><s:use href="https://example.test/x.svg#x"/></s:svg>'],
       ['namespace', '<s:svg xmlns:s="https://example.test/not-svg"><s:path d="M0 0"/></s:svg>'],
       ['unresolved', '<s:svg><s:path d="M0 0"/></s:svg>'],
+      ['unicode-script', '<é:svg xmlns:é="http://www.w3.org/2000/svg"><é:script>alert(1)</é:script></é:svg>'],
+      ['unicode-external', '<图:svg xmlns:图="http://www.w3.org/2000/svg"><图:use href="https://example.test/x.svg#x"/></图:svg>'],
+      ['xml-reserved', '<xml:svg xmlns:xml="http://www.w3.org/2000/svg"><xml:path d="M0 0"/></xml:svg>'],
+      ['xmlns-reserved', '<xmlns:svg xmlns:xmlns="http://www.w3.org/2000/svg"><xmlns:path d="M0 0"/></xmlns:svg>'],
+      ['multiple-colons', '<s:x:svg xmlns:s="http://www.w3.org/2000/svg"><s:path d="M0 0"/></s:x:svg>'],
+      ['invalid-name', '<1s:svg xmlns:1s="http://www.w3.org/2000/svg"><1s:path d="M0 0"/></1s:svg>'],
+      ['invalid-name-suffix', '<s:svg$ xmlns:s="http://www.w3.org/2000/svg"><s:path d="M0 0"/></s:svg$>'],
     ] as const) {
       const bytes = encoder.encode(source);
       const path = `public/prefixed-${name}.txt`;
@@ -1073,6 +1087,11 @@ describe('deterministic migration bundle', () => {
       {
         path: 'components/prefixed-icon.tsx',
         bytes: encoder.encode("export const icon = '<s:svg xmlns:s=\\\"http://www.w3.org/2000/svg\\\"></s:svg>';\n"),
+        executable: false,
+      },
+      {
+        path: 'components/unicode-prefixed-icon.tsx',
+        bytes: encoder.encode("export const icon = '<é:svg xmlns:é=\\\"http://www.w3.org/2000/svg\\\"></é:svg><s.x:svg xmlns:s.x=\\\"http://www.w3.org/2000/svg\\\"></s.x:svg>';\n"),
         executable: false,
       },
       {

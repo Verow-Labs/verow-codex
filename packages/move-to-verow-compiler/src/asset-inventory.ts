@@ -391,6 +391,126 @@ function validCaptureReceiptLinkage(receipt: CaptureReceiptV1, bytes: Uint8Array
 
 const SVG_DOCUMENT_PREFIX_BYTES = 65_536;
 const SVG_NAMESPACE = 'http://www.w3.org/2000/svg';
+const XLINK_NAMESPACE = 'http://www.w3.org/1999/xlink';
+const XML_QNAME_MAX_CODE_POINTS = 256;
+
+interface XmlQName {
+  raw: string;
+  prefix: string | null;
+  local: string;
+  end: number;
+}
+
+function inCodePointRange(value: number, start: number, end: number): boolean {
+  return value >= start && value <= end;
+}
+
+function isXmlNcNameStart(value: number): boolean {
+  return value === 0x5f ||
+    inCodePointRange(value, 0x41, 0x5a) ||
+    inCodePointRange(value, 0x61, 0x7a) ||
+    inCodePointRange(value, 0xc0, 0xd6) ||
+    inCodePointRange(value, 0xd8, 0xf6) ||
+    inCodePointRange(value, 0xf8, 0x2ff) ||
+    inCodePointRange(value, 0x370, 0x37d) ||
+    inCodePointRange(value, 0x37f, 0x1fff) ||
+    inCodePointRange(value, 0x200c, 0x200d) ||
+    inCodePointRange(value, 0x2070, 0x218f) ||
+    inCodePointRange(value, 0x2c00, 0x2fef) ||
+    inCodePointRange(value, 0x3001, 0xd7ff) ||
+    inCodePointRange(value, 0xf900, 0xfdcf) ||
+    inCodePointRange(value, 0xfdf0, 0xfffd) ||
+    inCodePointRange(value, 0x10000, 0xeffff);
+}
+
+function isXmlNcNameChar(value: number): boolean {
+  return isXmlNcNameStart(value) ||
+    value === 0x2d ||
+    value === 0x2e ||
+    inCodePointRange(value, 0x30, 0x39) ||
+    value === 0xb7 ||
+    inCodePointRange(value, 0x300, 0x36f) ||
+    inCodePointRange(value, 0x203f, 0x2040);
+}
+
+function readXmlNcName(source: string, start: number): { value: string; end: number } | null {
+  const first = source.codePointAt(start);
+  if (first === undefined || !isXmlNcNameStart(first)) return null;
+  let cursor = start;
+  let count = 0;
+  while (cursor < source.length) {
+    const value = source.codePointAt(cursor);
+    if (value === undefined || !isXmlNcNameChar(value)) break;
+    count += 1;
+    if (count > XML_QNAME_MAX_CODE_POINTS) return null;
+    cursor += value > 0xffff ? 2 : 1;
+  }
+  return { value: source.slice(start, cursor), end: cursor };
+}
+
+function readXmlQName(source: string, start: number): XmlQName | null {
+  const first = readXmlNcName(source, start);
+  if (first === null) return null;
+  if (source[first.end] !== ':') {
+    return { raw: first.value, prefix: null, local: first.value, end: first.end };
+  }
+  const second = readXmlNcName(source, first.end + 1);
+  if (
+    second === null ||
+    source[second.end] === ':' ||
+    Array.from(source.slice(start, second.end)).length > XML_QNAME_MAX_CODE_POINTS
+  ) return null;
+  return {
+    raw: source.slice(start, second.end),
+    prefix: first.value,
+    local: second.value,
+    end: second.end,
+  };
+}
+
+function readMarkupNameCandidate(
+  source: string,
+  start: number,
+): { raw: string; end: number; overflow: boolean } {
+  let cursor = start;
+  let count = 0;
+  while (cursor < source.length && !/[\t\n\f\r />]/u.test(source[cursor] as string)) {
+    const value = source.codePointAt(cursor) as number;
+    count += 1;
+    if (count > XML_QNAME_MAX_CODE_POINTS) return { raw: '', end: cursor, overflow: true };
+    cursor += value > 0xffff ? 2 : 1;
+  }
+  return { raw: source.slice(start, cursor), end: cursor, overflow: false };
+}
+
+function parseExactXmlQName(raw: string): XmlQName | null {
+  const parsed = readXmlQName(raw, 0);
+  return parsed !== null && parsed.end === raw.length ? parsed : null;
+}
+
+function isPotentialSvgQName(candidate: { raw: string; overflow: boolean }): boolean {
+  if (candidate.overflow) return true;
+  const parsed = parseExactXmlQName(candidate.raw);
+  if (parsed !== null) return parsed.local.toLowerCase() === 'svg';
+  const parts = candidate.raw.split(':');
+  const local = parts.at(-1) ?? '';
+  if (local.toLowerCase() === 'svg' || (parts.length > 2 && parts.some((part) => part.toLowerCase() === 'svg'))) {
+    return true;
+  }
+  const partialLocal = readXmlNcName(local, 0);
+  return partialLocal?.value.toLowerCase() === 'svg' && partialLocal.end < local.length;
+}
+
+function isReservedXmlPrefix(prefix: string): boolean {
+  const lower = prefix.toLowerCase();
+  return lower === 'xml' || lower === 'xmlns';
+}
+
+function skipXmlWhitespace(source: string, start: number): number {
+  let cursor = start;
+  while (cursor < source.length && /[\t\n\r ]/u.test(source[cursor] as string)) cursor += 1;
+  return cursor;
+}
 
 function skipAsciiWhitespace(source: string, start: number): number {
   let cursor = start;
@@ -444,15 +564,15 @@ export function hasMigrationSvgDocumentStart(bytes: Uint8Array): boolean {
     }
     if (source.slice(cursor, cursor + 9).toLowerCase() === '<!doctype') {
       const nameStart = skipAsciiWhitespace(source, cursor + 9);
-      const name = /^[A-Za-z_:][\w:.-]*/u.exec(source.slice(nameStart))?.[0]?.toLowerCase();
-      if (name === 'svg') return true;
+      if (isPotentialSvgQName(readMarkupNameCandidate(source, nameStart))) return true;
       const end = markupDeclarationEnd(source, nameStart);
       if (end === null) return truncated;
       cursor = end;
       continue;
     }
-    const root = /^<\s*(?:[A-Za-z_][\w.-]*:)?svg(?=[\t\n\f\r />]|$)/iu.exec(source.slice(cursor));
-    return root !== null;
+    if (source[cursor] !== '<') return false;
+    const nameStart = skipAsciiWhitespace(source, cursor + 1);
+    return isPotentialSvgQName(readMarkupNameCandidate(source, nameStart));
   }
   return truncated;
 }
@@ -467,7 +587,78 @@ function stripSvgXmlDeclaration(source: string): string | null {
   return source.slice(rootStart);
 }
 
-interface SvgElementFrame { id?: string; tag: string }
+interface SvgElementFrame { id?: string; qname: string }
+
+interface ParsedXmlAttribute {
+  qname: XmlQName;
+  value: string;
+}
+
+interface ParsedXmlTag {
+  attributes: ParsedXmlAttribute[];
+  closing: boolean;
+  end: number;
+  qname: XmlQName;
+  selfClosing: boolean;
+}
+
+function parseXmlTag(source: string, start: number): ParsedXmlTag | null {
+  if (source[start] !== '<') return null;
+  let cursor = start + 1;
+  const closing = source[cursor] === '/';
+  if (closing) cursor += 1;
+  const qname = readXmlQName(source, cursor);
+  if (qname === null) return null;
+  cursor = qname.end;
+  if (closing) {
+    cursor = skipXmlWhitespace(source, cursor);
+    return source[cursor] === '>'
+      ? { attributes: [], closing: true, end: cursor + 1, qname, selfClosing: false }
+      : null;
+  }
+  const attributes: ParsedXmlAttribute[] = [];
+  while (cursor < source.length) {
+    const beforeWhitespace = cursor;
+    cursor = skipXmlWhitespace(source, cursor);
+    if (source.startsWith('/>', cursor)) {
+      return { attributes, closing: false, end: cursor + 2, qname, selfClosing: true };
+    }
+    if (source[cursor] === '>') {
+      return { attributes, closing: false, end: cursor + 1, qname, selfClosing: false };
+    }
+    if (cursor === beforeWhitespace || attributes.length >= 256) return null;
+    const attributeQName = readXmlQName(source, cursor);
+    if (attributeQName === null) return null;
+    cursor = skipXmlWhitespace(source, attributeQName.end);
+    if (source[cursor] !== '=') return null;
+    cursor = skipXmlWhitespace(source, cursor + 1);
+    const quote = source[cursor];
+    if (quote !== '"' && quote !== "'") return null;
+    const valueStart = cursor + 1;
+    const valueEnd = source.indexOf(quote, valueStart);
+    if (valueEnd < 0) return null;
+    const value = source.slice(valueStart, valueEnd);
+    if (value.includes('<')) return null;
+    attributes.push({ qname: attributeQName, value });
+    cursor = valueEnd + 1;
+  }
+  return null;
+}
+
+function svgRootQName(source: string): XmlQName | null {
+  if (source[0] !== '<') return null;
+  const qname = readXmlQName(source, 1);
+  if (
+    qname === null ||
+    qname.local !== 'svg' ||
+    !/[\t\n\r />]/u.test(source[qname.end] ?? '')
+  ) return null;
+  return qname;
+}
+
+function escapeRegularExpression(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
+}
 
 function svgBytesForMetadata(bytes: Uint8Array): Uint8Array | null {
   let source: string;
@@ -478,11 +669,11 @@ function svgBytesForMetadata(bytes: Uint8Array): Uint8Array | null {
   }
   const declarationFreeSource = stripSvgXmlDeclaration(source);
   if (declarationFreeSource === null) return null;
-  const rootName = /^<((?:[A-Za-z_][\w.-]*:)?svg)(?=[\t\n\f\r />]|$)/u.exec(declarationFreeSource)?.[1];
-  if (rootName === undefined || !rootName.includes(':')) return bytes;
-  const prefix = rootName.slice(0, rootName.indexOf(':'));
+  const rootQName = svgRootQName(declarationFreeSource);
+  if (rootQName === null || rootQName.prefix === null) return rootQName === null ? null : bytes;
+  const prefix = rootQName.prefix;
   const namespacePattern = new RegExp(
-    `\\s+xmlns:${prefix}\\s*=\\s*(["'])${SVG_NAMESPACE}\\1`,
+    `\\s+xmlns:${escapeRegularExpression(prefix)}\\s*=\\s*(["'])${SVG_NAMESPACE}\\1`,
     'u',
   );
   const metadataSource = source
@@ -503,83 +694,100 @@ function validateSafeSvg(bytes: Uint8Array, limits: AssetInventoryLimits): boole
   const declarationFreeSource = stripSvgXmlDeclaration(source);
   if (declarationFreeSource === null) return false;
   source = declarationFreeSource;
-  const rootName = /^<((?:[A-Za-z_][\w.-]*:)?svg)(?=[\t\n\f\r />]|$)/u.exec(source)?.[1];
-  if (rootName === undefined) return false;
-  const rootSeparator = rootName.indexOf(':');
-  const rootPrefix = rootSeparator < 0 ? null : rootName.slice(0, rootSeparator);
+  const rootQName = svgRootQName(source);
+  if (rootQName === null || (rootQName.prefix !== null && isReservedXmlPrefix(rootQName.prefix))) {
+    return false;
+  }
   if (hasControlCharacters(source) || /<!DOCTYPE|<!ENTITY|<!\[CDATA|<!--|<\?(?!xml\s)|&/iu.test(source)) return false;
-  if (/<\s*(?:script|foreignObject|style|animate|animateMotion|animateTransform|set|filter|fe\w+|image|audio|video|iframe|object|embed|link|meta)\b/iu.test(source)) return false;
   if (/\son[a-z][\w:-]*\s*=|\sstyle\s*=|@import|url\s*\(/iu.test(source)) return false;
   const allowedTags = new Set(['svg', 'g', 'defs', 'symbol', 'use', 'rect', 'circle', 'ellipse', 'line', 'polyline', 'polygon', 'path', 'title', 'desc']);
   const allowedAttributes = new Set([
-    'xmlns', 'xmlns:xlink', 'id', 'href', 'xlink:href', 'width', 'height', 'viewbox', 'x', 'y', 'x1', 'x2', 'y1', 'y2',
+    'id', 'href', 'xlink:href', 'width', 'height', 'viewbox', 'x', 'y', 'x1', 'x2', 'y1', 'y2',
     'cx', 'cy', 'r', 'rx', 'ry', 'd', 'points', 'fill', 'fill-rule', 'stroke', 'stroke-width', 'stroke-linecap',
     'stroke-linejoin', 'opacity', 'transform', 'preserveaspectratio', 'role', 'aria-label',
   ]);
   const stack: SvgElementFrame[] = [];
+  const namespaces = new Map<string, string>();
   const ids = new Set<string>();
   const edges = new Map<string, Set<string>>();
   const referenced = new Set<string>();
-  const tokenPattern = /<\s*(\/?)\s*([A-Za-z][\w:-]*)([^<>]*?)(\/?)\s*>/gu;
-  let lastIndex = 0;
+  let cursor = 0;
   let rootSeen = false;
-  let rootNamespaceSeen = rootPrefix === null;
+  let rootClosed = false;
   let referenceCount = 0;
-  let match: RegExpExecArray | null;
-  while ((match = tokenPattern.exec(source)) !== null) {
-    const between = source.slice(lastIndex, match.index);
-    if (/[<>]/u.test(between)) return false;
-    lastIndex = tokenPattern.lastIndex;
-    const closing = match[1] === '/';
-    const rawTag = match[2] ?? '';
-    const separator = rawTag.indexOf(':');
-    const tagPrefix = separator < 0 ? null : rawTag.slice(0, separator);
-    const localTag = separator < 0 ? rawTag : rawTag.slice(separator + 1);
-    if (
-      (rootPrefix === null && tagPrefix !== null) ||
-      (rootPrefix !== null && tagPrefix !== rootPrefix) ||
-      (rootPrefix !== null && localTag !== localTag.toLowerCase())
-    ) {
-      return false;
+  while (cursor < source.length) {
+    const tagStart = source.indexOf('<', cursor);
+    if (tagStart < 0) {
+      const trailing = source.slice(cursor);
+      if (trailing.includes('>') || (stack.length === 0 && trailing.trim().length > 0)) return false;
+      cursor = source.length;
+      break;
     }
-    const tag = localTag.toLowerCase();
-    if (!allowedTags.has(tag)) return false;
-    if (closing) {
-      if ((match[3] ?? '').trim() || match[4] === '/' || stack.at(-1)?.tag !== tag) return false;
+    const between = source.slice(cursor, tagStart);
+    if (between.includes('>') || (stack.length === 0 && between.trim().length > 0)) return false;
+    const parsed = parseXmlTag(source, tagStart);
+    if (parsed === null) return false;
+    cursor = parsed.end;
+    if (parsed.closing) {
+      if (stack.at(-1)?.qname !== parsed.qname.raw) return false;
       stack.pop();
+      if (stack.length === 0) rootClosed = true;
       continue;
     }
     const isRoot = !rootSeen;
     if (isRoot) {
-      if (tag !== 'svg') return false;
+      if (parsed.qname.raw !== rootQName.raw) return false;
       rootSeen = true;
+    } else if (rootClosed || stack.length === 0) {
+      return false;
     }
-    const rawAttributes = match[3] ?? '';
-    const attributes = new Map<string, string>();
-    const attributePattern = /([A-Za-z_:][\w:.-]*)\s*=\s*(?:"([^"]*)"|'([^']*)')/gu;
-    let attributeCursor = 0;
-    let attribute: RegExpExecArray | null;
-    while ((attribute = attributePattern.exec(rawAttributes)) !== null) {
-      if (rawAttributes.slice(attributeCursor, attribute.index).trim()) return false;
-      attributeCursor = attributePattern.lastIndex;
-      const rawName = attribute[1] ?? '';
-      const name = rawName.toLowerCase();
-      const value = attribute[2] ?? attribute[3] ?? '';
-      const rootNamespaceName = rootPrefix === null ? null : `xmlns:${rootPrefix}`;
-      const isRootNamespace = isRoot && rawName === rootNamespaceName;
-      if (
-        (!allowedAttributes.has(name) && !isRootNamespace) ||
-        (name.startsWith('xmlns:') && name !== 'xmlns:xlink' && !isRootNamespace) ||
-        attributes.has(name) ||
-        hasControlCharacters(value)
-      ) return false;
-      if (isRootNamespace) {
-        if (value !== SVG_NAMESPACE) return false;
-        rootNamespaceSeen = true;
+    for (const attribute of parsed.attributes) {
+      const declaration = attribute.qname.prefix === 'xmlns'
+        ? attribute.qname.local
+        : attribute.qname.prefix === null && attribute.qname.local === 'xmlns'
+          ? ''
+          : null;
+      if (declaration === null) continue;
+      if (!isRoot || (declaration !== '' && isReservedXmlPrefix(declaration)) || namespaces.has(declaration)) {
+        return false;
       }
-      attributes.set(name, value);
+      if (declaration === '') {
+        if (attribute.value !== SVG_NAMESPACE) return false;
+      } else if (declaration === rootQName.prefix) {
+        if (attribute.value !== SVG_NAMESPACE) return false;
+      } else if (declaration === 'xlink') {
+        if (attribute.value !== XLINK_NAMESPACE) return false;
+      } else {
+        return false;
+      }
+      namespaces.set(declaration, attribute.value);
     }
-    if (rawAttributes.slice(attributeCursor).trim()) return false;
+    const elementNamespace = parsed.qname.prefix === null
+      ? namespaces.get('') ?? (rootQName.prefix === null ? SVG_NAMESPACE : null)
+      : namespaces.get(parsed.qname.prefix);
+    if (elementNamespace !== SVG_NAMESPACE || !allowedTags.has(parsed.qname.local)) return false;
+    const attributes = new Map<string, string>();
+    for (const attribute of parsed.attributes) {
+      const declaration = attribute.qname.prefix === 'xmlns' ||
+        (attribute.qname.prefix === null && attribute.qname.local === 'xmlns');
+      if (declaration) continue;
+      let name: string;
+      if (attribute.qname.prefix === null) {
+        name = attribute.qname.local.toLowerCase();
+      } else if (
+        attribute.qname.prefix === 'xlink' &&
+        attribute.qname.local === 'href' &&
+        namespaces.get('xlink') === XLINK_NAMESPACE
+      ) {
+        name = 'xlink:href';
+      } else {
+        return false;
+      }
+      if (!allowedAttributes.has(name) || attributes.has(name) || hasControlCharacters(attribute.value)) {
+        return false;
+      }
+      attributes.set(name, attribute.value);
+    }
     const id = attributes.get('id');
     if (id !== undefined) {
       if (!/^[A-Za-z_][\w.-]{0,127}$/u.test(id) || ids.has(id)) return false;
@@ -600,12 +808,14 @@ function validateSafeSvg(bytes: Uint8Array, limits: AssetInventoryLimits): boole
         edges.set(owner, outgoing);
       }
     }
-    if (match[4] !== '/') {
-      stack.push({ tag, ...(id === undefined ? {} : { id }) });
+    if (!parsed.selfClosing) {
+      stack.push({ qname: parsed.qname.raw, ...(id === undefined ? {} : { id }) });
       if (stack.length > 256) return false;
+    } else if (isRoot) {
+      rootClosed = true;
     }
   }
-  if (!rootSeen || !rootNamespaceSeen || stack.length > 0 || /[<>]/u.test(source.slice(lastIndex)) || [...referenced].some((id) => !ids.has(id))) return false;
+  if (!rootSeen || !rootClosed || stack.length > 0 || [...referenced].some((id) => !ids.has(id))) return false;
   const visiting = new Set<string>();
   const visited = new Set<string>();
   const cyclic = (node: string): boolean => {

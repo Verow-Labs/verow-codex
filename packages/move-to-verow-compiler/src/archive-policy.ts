@@ -169,6 +169,16 @@ const CREDENTIAL_PROVIDER_TOKENS = new Set([
   'supabase',
   'vercel',
 ]);
+const CREDENTIAL_SENSITIVE_TOKENS = new Set([
+  'credential',
+  'credentials',
+  'key',
+  'secret',
+  'secrets',
+  'token',
+  'tokens',
+]);
+const CREDENTIAL_AUTH_CONTEXT_TOKENS = new Set(['auth', 'refresh']);
 const PDF_PREFIX_WHITESPACE = new Set([0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x20]);
 interface BlockedFormat {
   extensions: readonly string[];
@@ -328,10 +338,11 @@ function hasCredentialBasename(name: string): boolean {
   if (tokens.length === 1 && CREDENTIAL_SINGLETON_TOKENS.has(tokens[0] as string)) {
     return true;
   }
+  const hasSensitiveToken = tokens.some((token) => CREDENTIAL_SENSITIVE_TOKENS.has(token));
   if (
-    tokens.length === 2 &&
-    CREDENTIAL_PROVIDER_TOKENS.has(tokens[0] as string) &&
-    CREDENTIAL_SINGLETON_TOKENS.has(tokens[1] as string)
+    hasSensitiveToken &&
+    (tokens.some((token) => CREDENTIAL_PROVIDER_TOKENS.has(token)) ||
+      tokens.some((token) => CREDENTIAL_AUTH_CONTEXT_TOKENS.has(token)))
   ) {
     return true;
   }
